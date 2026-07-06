@@ -448,6 +448,9 @@ int llama_cli(int argc, char ** argv) {
     console::log("%s\n", LLAMA_ASCII_LOGO);
     console::log("build      : %s\n", inf.build_info.c_str());
     console::log("model      : %s\n", inf.model_name.c_str());
+    if (!inf.model_ftype.empty()) {
+        console::log("ftype      : %s\n", inf.model_ftype.c_str());
+    }
     console::log("modalities : %s\n", modalities.c_str());
     if (!params.system_prompt.empty()) {
         console::log("using custom system prompt\n");
@@ -647,6 +650,7 @@ int llama_cli(int argc, char ** argv) {
             cur_msg.clear();
         }
         result_timings timings;
+        llama_moe_stream_stats_reset(ctx_cli.ctx_server.get_llama_context());
         std::string assistant_content = ctx_cli.generate_completion(timings);
         ctx_cli.messages.push_back({
             {"role",    "assistant"},
@@ -660,6 +664,7 @@ int llama_cli(int argc, char ** argv) {
             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
             console::set_display(DISPLAY_TYPE_RESET);
         }
+        llama_moe_stream_stats_print(ctx_cli.ctx_server.get_llama_context());
 
         if (params.single_turn) {
             break;

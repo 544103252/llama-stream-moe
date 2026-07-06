@@ -112,6 +112,11 @@ struct llama_moe_stream_work {
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
 };
 
+struct llama_moe_stream_token_stats {
+    int64_t n_hit  = 0;
+    int64_t n_miss = 0;
+};
+
 struct llama_moe_stream {
     uint32_t n_slots      = 0; // expert cache slots per streamed layer
     int32_t  n_io_threads = 0;
@@ -139,6 +144,8 @@ struct llama_moe_stream {
     size_t size_bufs() const;
 
     void print_stats() const;
+    void token_stats_begin();
+    llama_moe_stream_token_stats token_stats_end();
 
     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
 
@@ -178,9 +185,13 @@ struct llama_moe_stream {
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
     } stats;
 
+    bool token_stats_active = false;
+    llama_moe_stream_token_stats token_stats;
+
     // internals
     void start_workers_locked();
     void worker_loop();
+    void count_token_stats_locked(const llama_moe_stream_layer & sl, const int32_t * ids, uint32_t n_ids, int64_t n_tokens);
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
 

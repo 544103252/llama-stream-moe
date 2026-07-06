@@ -1320,7 +1320,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_status & ret,
+        bool moe_stats_prefill) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1380,7 +1385,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    llama_moe_stream * mstream = moe_stats_active ? model.moe_stream() : nullptr;
+    if (mstream) {
+        mstream->token_stats_begin();
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (mstream) {
+        const auto stats = mstream->token_stats_end();
+        auto & phase = moe_stats_prefill ? this->moe_stats_prefill : moe_stats_decode;
+        phase.n_hit  += stats.n_hit;
+        phase.n_miss += stats.n_miss;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1454,7 +1471,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status, false);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -1859,7 +1876,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(
+                ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, n_tokens_all > 1);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3231,6 +3249,28 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+void llama_context::moe_stream_stats_reset() {
+    moe_stats_prefill = {};
+    moe_stats_decode  = {};
+    moe_stats_active  = model.moe_stream() != nullptr;
+}
+
+void llama_context::moe_stream_stats_print() const {
+    if (!moe_stats_active || model.moe_stream() == nullptr) {
+        return;
+    }
+
+    const auto print_phase = [](const char * phase, int64_t n_hit, int64_t n_miss) {
+        const int64_t total = n_hit + n_miss;
+        const double hit_rate = total > 0 ? 100.0*n_hit/total : 0.0;
+        std::fprintf(stderr, "[CACHE_EXPERT][%s] hit=%" PRId64 " miss=%" PRId64
+                " total=%" PRId64 " hit_rate=%.2f%%\n", phase, n_hit, n_miss, total, hit_rate);
+    };
+
+    print_phase("prefill", moe_stats_prefill.n_hit, moe_stats_prefill.n_miss);
+    print_phase("decode",  moe_stats_decode.n_hit,  moe_stats_decode.n_miss);
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -4133,6 +4173,18 @@ void llama_perf_context_print(const llama_context * ctx) {
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
+}
+
+void llama_moe_stream_stats_reset(llama_context * ctx) {
+    if (ctx) {
+        ctx->moe_stream_stats_reset();
+    }
+}
+
+void llama_moe_stream_stats_print(const llama_context * ctx) {
+    if (ctx) {
+        ctx->moe_stream_stats_print();
+    }
 }
 
 //

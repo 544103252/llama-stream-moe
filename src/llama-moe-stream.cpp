@@ -415,6 +415,41 @@ size_t llama_moe_stream::size_bufs() const {
     return size;
 }
 
+void llama_moe_stream::token_stats_begin() {
+    std::lock_guard<std::mutex> lock(mtx);
+    token_stats = {};
+    token_stats_active = true;
+}
+
+llama_moe_stream_token_stats llama_moe_stream::token_stats_end() {
+    std::lock_guard<std::mutex> lock(mtx);
+    token_stats_active = false;
+    return token_stats;
+}
+
+void llama_moe_stream::count_token_stats_locked(
+        const llama_moe_stream_layer & sl, const int32_t * ids, uint32_t n_ids, int64_t n_tokens) {
+    if (!token_stats_active) {
+        return;
+    }
+    for (int64_t t = 0; t < n_tokens; t++) {
+        bool hit = true;
+        for (uint32_t r = 0; r < n_ids; r++) {
+            const int32_t e = ids[t*n_ids + r];
+            const auto it = sl.expert_slot.find(e);
+            if (it == sl.expert_slot.end() || sl.slot_state[it->second] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                hit = false;
+                break;
+            }
+        }
+        if (hit) {
+            token_stats.n_hit++;
+        } else {
+            token_stats.n_miss++;
+        }
+    }
+}
+
 void llama_moe_stream::print_stats() const {
     std::lock_guard<std::mutex> lock(mtx);
 
@@ -461,6 +496,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 
     mgr->stats.n_calls++;
     mgr->start_workers_locked();
+
+    mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);
 
     // distinct experts touched by this ubatch, in first-use order
     sl->touched.assign(sl->n_expert, 0);
@@ -799,6 +836,7 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     mgr->stats.n_wave_calls++;
 
     if (w == 0) {
+        mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);
         mgr->plan_waves_locked(*sl, ids, n);
     }
     GGML_ASSERT(sl->plan_next_wave == w); // waves must run in order (enforced by the graph ordering token)
