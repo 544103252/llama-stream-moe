@@ -209,6 +209,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->slot_claimed .resize(n_slots, 0);
         sl->slot_gen     .resize(n_slots, 0);
         sl->slot_last_use.resize(n_slots, 0);
+        sl->expert_map   .resize(n_expert, -1);
         sl->route_hotness.resize(n_expert, 0);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
@@ -407,12 +408,222 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
     sl.seen[expert] = 1;
 }
 
+void llama_moe_stream::refresh_expert_map_locked(llama_moe_stream_layer & sl) const {
+    std::fill(sl.expert_map.begin(), sl.expert_map.end(), -1);
+    for (uint32_t s = 0; s < sl.n_slots; s++) {
+        if (sl.slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+            continue;
+        }
+        const int32_t expert = sl.slot_expert[s];
+        GGML_ASSERT(expert >= 0 && (uint32_t) expert < sl.n_expert);
+        GGML_ASSERT(sl.expert_map[expert] == -1);
+        sl.expert_map[expert] = s;
+    }
+}
+
+bool llama_moe_stream::build_plan_locked(
+        llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
+    auto & plan = sl.plan;
+
+    plan.loads.clear();
+    plan.next_map.clear();
+    plan.mapped_topk.resize(n);
+    plan.required_slots.clear();
+    std::fill(sl.keep.begin(), sl.keep.end(), 0);
+
+    refresh_expert_map_locked(sl);
+
+    bool has_missing = false;
+    for (const int32_t expert : sl.uniq) {
+        if (sl.expert_slot.find(expert) == sl.expert_slot.end()) {
+            has_missing = true;
+            break;
+        }
+    }
+
+    if (!has_missing) {
+        for (const int32_t expert : sl.uniq) {
+            const int32_t slot = sl.expert_slot.at(expert);
+            sl.keep[slot] = 1;
+            plan.required_slots.push_back(slot);
+        }
+        for (int64_t i = 0; i < n; i++) {
+            plan.mapped_topk[i] = sl.expert_slot.at(ids[i]);
+        }
+        return true;
+    }
+
+    plan.next_map = sl.expert_map;
+    for (const int32_t expert : sl.uniq) {
+        const auto it = sl.expert_slot.find(expert);
+        if (it != sl.expert_slot.end() &&
+                sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_LOADING) {
+            plan.next_map[expert] = it->second;
+        }
+    }
+
+    for (const int32_t expert : sl.uniq) {
+        int32_t slot = plan.next_map[expert];
+        if (slot < 0) {
+            slot = pick_victim_locked(sl, sl.keep.data());
+            if (slot < 0) {
+                return false;
+            }
+
+            const int32_t victim = sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_EMPTY ?
+                    -1 : sl.slot_expert[slot];
+            GGML_ASSERT(victim < 0 || plan.next_map[victim] == slot);
+
+            plan.loads.push_back({ expert, victim, slot });
+            if (victim >= 0) {
+                plan.next_map[victim] = -1;
+            }
+            plan.next_map[expert] = slot;
+        }
+
+        sl.keep[slot] = 1;
+        plan.required_slots.push_back(slot);
+    }
+
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t slot = plan.next_map[ids[i]];
+        GGML_ASSERT(slot >= 0 && (uint32_t) slot < sl.n_slots);
+        plan.mapped_topk[i] = slot;
+    }
+
+    return true;
+}
+
+void llama_moe_stream::apply_plan_locked(
+        std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl) {
+    auto & plan = sl.plan;
+
+    for (const auto & load : plan.loads) {
+        GGML_ASSERT(load.expert >= 0 && (uint32_t) load.expert < sl.n_expert);
+        GGML_ASSERT(load.slot >= 0 && (uint32_t) load.slot < sl.n_slots);
+        GGML_ASSERT(load.victim < 0 || sl.slot_expert[load.slot] == load.victim);
+
+        if (!sl.seen[load.expert]) {
+            stats.n_miss_cold++;
+        }
+        reserve_slot_locked(sl, load.expert, load.slot);
+    }
+
+    stats.n_miss += plan.loads.size();
+    stats.n_hit  += sl.uniq.size() - plan.loads.size();
+
+    bool waited = false;
+    for (const int32_t slot : plan.required_slots) {
+        GGML_ASSERT(slot >= 0 && (uint32_t) slot < sl.n_slots);
+        if (sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_LOADING) {
+            q_demand.push_back({ &sl, sl.slot_expert[slot], slot, sl.slot_gen[slot] });
+            cv_work.notify_one();
+            waited = true;
+        }
+    }
+
+    if (!waited) {
+        return;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    cv_done.wait(lk, [&] {
+        if (load_failed) {
+            return true;
+        }
+        for (const int32_t slot : plan.required_slots) {
+            if (sl.slot_state[slot] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                return false;
+            }
+        }
+        return true;
+    });
+    if (load_failed) {
+        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+    }
+    stats.t_stall_us += ggml_time_us() - t0;
+}
+
+void llama_moe_stream::commit_plan_locked(
+        llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int64_t n) {
+    auto & plan = sl.plan;
+
+    GGML_ASSERT(plan.mapped_topk.size() == (size_t) n);
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t expert = ids[i];
+        const int32_t slot = plan.mapped_topk[i];
+        GGML_ASSERT(slot >= 0 && (uint32_t) slot < sl.n_slots);
+        GGML_ASSERT(sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+        GGML_ASSERT(sl.slot_expert[slot] == expert);
+        if (!plan.next_map.empty()) {
+            GGML_ASSERT(plan.next_map[expert] == slot);
+        }
+    }
+
+    if (!plan.next_map.empty()) {
+        for (uint32_t expert = 0; expert < sl.n_expert; expert++) {
+            const int32_t slot = plan.next_map[expert];
+            if (slot >= 0) {
+                GGML_ASSERT((uint32_t) slot < sl.n_slots);
+                GGML_ASSERT(sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+                GGML_ASSERT(sl.slot_expert[slot] == (int32_t) expert);
+            }
+        }
+        sl.expert_map = plan.next_map;
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            sl.expert_map[ids[i]] = plan.mapped_topk[i];
+        }
+    }
+
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t slot = plan.mapped_topk[i];
+        sl.slot_last_use[slot] = ++sl.use_counter;
+        out[i] = slot;
+    }
+}
+
 size_t llama_moe_stream::size_bufs() const {
     size_t size = 0;
     for (const auto & buf : bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
     }
     return size;
+}
+
+void llama_moe_stream::token_stats_begin() {
+    std::lock_guard<std::mutex> lock(mtx);
+    token_stats = {};
+    token_stats_active = true;
+}
+
+llama_moe_stream_token_stats llama_moe_stream::token_stats_end() {
+    std::lock_guard<std::mutex> lock(mtx);
+    token_stats_active = false;
+    return token_stats;
+}
+
+void llama_moe_stream::count_token_stats_locked(
+        const llama_moe_stream_layer & sl, const int32_t * ids, uint32_t n_ids, int64_t n_tokens) {
+    if (!token_stats_active) {
+        return;
+    }
+    for (int64_t t = 0; t < n_tokens; t++) {
+        bool hit = true;
+        for (uint32_t r = 0; r < n_ids; r++) {
+            const int32_t e = ids[t*n_ids + r];
+            const auto it = sl.expert_slot.find(e);
+            if (it == sl.expert_slot.end() || sl.slot_state[it->second] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                hit = false;
+                break;
+            }
+        }
+        if (hit) {
+            token_stats.n_hit++;
+        } else {
+            token_stats.n_miss++;
+        }
+    }
 }
 
 void llama_moe_stream::print_stats() const {
@@ -462,6 +673,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mgr->stats.n_calls++;
     mgr->start_workers_locked();
 
+    mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);
+
     // distinct experts touched by this ubatch, in first-use order
     sl->touched.assign(sl->n_expert, 0);
     sl->uniq.clear();
@@ -494,69 +707,15 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
-    // classify the touched experts; reserve and enqueue demand loads in deterministic order
-    std::fill(sl->keep.begin(), sl->keep.end(), 0);
-    sl->demand_slots.clear();
-
-    bool waited = false;
-    for (const int32_t e : sl->uniq) {
-        const auto it = sl->expert_slot.find(e);
-        if (it != sl->expert_slot.end()) {
-            const int32_t s = it->second;
-            if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s] });
-                mgr->cv_work.notify_one();
-                waited = true;
-            }
-            mgr->stats.n_hit++;
-            sl->keep[s] = 1;
-            sl->demand_slots.push_back(s);
-        } else {
-            int32_t v;
-            while ((v = mgr->pick_victim_locked(*sl, sl->keep.data())) < 0) {
-                // every allowed slot is loading; wait for a commit and retry
-                mgr->cv_done.wait(lk);
-                if (mgr->load_failed) {
-                    GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
-                }
-            }
-            if (!sl->seen[e]) {
-                mgr->stats.n_miss_cold++;
-            }
-            mgr->reserve_slot_locked(*sl, e, v);
-            mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v] });
-            mgr->cv_work.notify_one();
-            mgr->stats.n_miss++;
-            waited = true;
-            sl->keep[v] = 1;
-            sl->demand_slots.push_back(v);
-        }
-    }
-
-    if (waited) {
-        const int64_t t0 = ggml_time_us();
-        mgr->cv_done.wait(lk, [&]{
-            if (mgr->load_failed) {
-                return true;
-            }
-            for (const int32_t s : sl->demand_slots) {
-                if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
-                    return false;
-                }
-            }
-            return true;
-        });
+    while (!mgr->build_plan_locked(*sl, ids, n)) {
+        mgr->cv_done.wait(lk);
         if (mgr->load_failed) {
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
-        mgr->stats.t_stall_us += ggml_time_us() - t0;
     }
 
-    for (int64_t i = 0; i < n; i++) {
-        const int32_t s = sl->expert_slot.at(ids[i]);
-        sl->slot_last_use[s] = ++sl->use_counter;
-        out[i] = s;
-    }
+    mgr->apply_plan_locked(lk, *sl);
+    mgr->commit_plan_locked(*sl, ids, out, n);
 }
 
 // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
@@ -799,6 +958,7 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     mgr->stats.n_wave_calls++;
 
     if (w == 0) {
+        mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);
         mgr->plan_waves_locked(*sl, ids, n);
     }
     GGML_ASSERT(sl->plan_next_wave == w); // waves must run in order (enforced by the graph ordering token)

@@ -49,6 +49,19 @@ struct llama_moe_stream_weight {
 
 struct llama_moe_stream_layer;
 
+struct llama_moe_stream_load {
+    int32_t expert = -1;
+    int32_t victim = -1;
+    int32_t slot   = -1;
+};
+
+struct llama_moe_stream_plan {
+    std::vector<llama_moe_stream_load> loads;
+    std::vector<int32_t> next_map;
+    std::vector<int32_t> mapped_topk;
+    std::vector<int32_t> required_slots;
+};
+
 // userdata of one wave's custom ops (multi-pass prefill): identifies which pass this is
 struct llama_moe_stream_wave {
     llama_moe_stream_layer * sl   = nullptr;
@@ -72,6 +85,7 @@ struct llama_moe_stream_layer {
     std::vector<uint64_t>                slot_gen;      // [n_slots] reservation generation
     std::vector<int64_t>                 slot_last_use; // [n_slots] LRU stamps
     std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
+    std::vector<int32_t>                 expert_map;    // [n_expert] committed RESIDENT mapping
 
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
     std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
@@ -82,6 +96,7 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> touched;
     std::vector<uint8_t> keep;         // [n_slots] slots the current call must not evict
     std::vector<int32_t> demand_slots; // slots the current call waits on
+    llama_moe_stream_plan plan;
 
     // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
     // plan_n_waves passes of at most plan_capacity experts each, run one pass at a time
@@ -112,6 +127,11 @@ struct llama_moe_stream_work {
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
 };
 
+struct llama_moe_stream_token_stats {
+    int64_t n_hit  = 0;
+    int64_t n_miss = 0;
+};
+
 struct llama_moe_stream {
     uint32_t n_slots      = 0; // expert cache slots per streamed layer
     int32_t  n_io_threads = 0;
@@ -139,6 +159,8 @@ struct llama_moe_stream {
     size_t size_bufs() const;
 
     void print_stats() const;
+    void token_stats_begin();
+    llama_moe_stream_token_stats token_stats_end();
 
     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
 
@@ -178,11 +200,20 @@ struct llama_moe_stream {
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
     } stats;
 
+    bool token_stats_active = false;
+    llama_moe_stream_token_stats token_stats;
+
     // internals
     void start_workers_locked();
     void worker_loop();
+    void count_token_stats_locked(const llama_moe_stream_layer & sl, const int32_t * ids, uint32_t n_ids, int64_t n_tokens);
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    void refresh_expert_map_locked(llama_moe_stream_layer & sl) const;
+    bool build_plan_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
+    void apply_plan_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl);
+    void commit_plan_locked(
+            llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int64_t n);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan

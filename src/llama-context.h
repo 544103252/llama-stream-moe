@@ -138,7 +138,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   moe_stats_prefill);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -186,6 +187,9 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+
+    void moe_stream_stats_reset();
+    void moe_stream_stats_print() const;
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -387,4 +391,11 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    struct {
+        int64_t n_hit  = 0;
+        int64_t n_miss = 0;
+    } moe_stats_prefill, moe_stats_decode;
+
+    bool moe_stats_active = false;
 };

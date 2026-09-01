@@ -650,6 +650,7 @@ int llama_cli(int argc, char ** argv) {
             cur_msg.clear();
         }
         result_timings timings;
+        llama_moe_stream_stats_reset(ctx_cli.ctx_server.get_llama_context());
         std::string assistant_content = ctx_cli.generate_completion(timings);
         ctx_cli.messages.push_back({
             {"role",    "assistant"},
@@ -663,6 +664,7 @@ int llama_cli(int argc, char ** argv) {
             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
             console::set_display(DISPLAY_TYPE_RESET);
         }
+        llama_moe_stream_stats_print(ctx_cli.ctx_server.get_llama_context());
 
         if (params.single_turn) {
             break;
