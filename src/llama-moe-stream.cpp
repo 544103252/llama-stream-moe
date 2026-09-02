@@ -145,6 +145,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+    shadow        = std::getenv("LLAMA_MOE_STREAM_SHADOW") != nullptr;
+    gpu_decode_requested = std::getenv("LLAMA_MOE_STREAM_GPU_DECODE") != nullptr;
+    gpu_decode_continuous_requested = std::getenv("LLAMA_MOE_STREAM_GPU_DECODE_CONTINUOUS") != nullptr;
     use_direct_io = direct;
 }
 
@@ -248,6 +251,235 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
                 __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
     }
+
+    if (!shadow || no_alloc) {
+        return;
+    }
+
+    bool enabled = false;
+    for (auto & layer_ptr : layers) {
+        if (!layer_ptr || layer_ptr->weights.empty()) {
+            continue;
+        }
+        auto & sl = *layer_ptr;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(
+                ggml_backend_buffer_get_type(sl.weights.front().cache->buffer));
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto get_ops = reg ? (ggml_backend_get_moe_stream_cache_ops_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_moe_stream_cache_ops") : nullptr;
+        if (get_ops == nullptr) {
+            continue;
+        }
+
+        ggml_backend_t backend = nullptr;
+        for (const auto & owned : shadow_backends) {
+            if (ggml_backend_get_device(owned.get()) == dev) {
+                backend = owned.get();
+                break;
+            }
+        }
+        if (backend == nullptr) {
+            backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                continue;
+            }
+            shadow_backends.emplace_back(backend);
+        }
+
+        sl.shadow_backend = backend;
+        sl.shadow_ops = get_ops();
+        sl.shadow_available_map.resize(sl.n_expert, -1);
+        enabled = true;
+    }
+
+    shadow = enabled;
+    if (shadow) {
+        LLAMA_LOG_INFO("%s: Stream MoE GPU planner shadow verification enabled\n", __func__);
+    } else {
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_STREAM_SHADOW requested, but no supported backend was found\n", __func__);
+    }
+}
+
+void llama_moe_stream::bind_decode_backends(const std::vector<ggml_backend_t> & backends) {
+    unbind_decode_backends();
+    if (!gpu_decode_requested) {
+        return;
+    }
+
+    ggml_backend_t common_backend = nullptr;
+    bool enabled = true;
+    for (auto & layer_ptr : layers) {
+        if (!layer_ptr || layer_ptr->weights.empty()) {
+            continue;
+        }
+        auto & sl = *layer_ptr;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(
+                ggml_backend_buffer_get_type(sl.weights.front().cache->buffer));
+        ggml_backend_t backend = nullptr;
+        for (ggml_backend_t candidate : backends) {
+            if (ggml_backend_get_device(candidate) == dev) {
+                backend = candidate;
+                break;
+            }
+        }
+
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto get_ops = reg ? (ggml_backend_get_moe_stream_cache_ops_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_moe_stream_cache_ops") : nullptr;
+        if (backend == nullptr || get_ops == nullptr ||
+                (common_backend != nullptr && common_backend != backend)) {
+            enabled = false;
+            break;
+        }
+
+        common_backend = backend;
+        sl.decode_backend = backend;
+        sl.decode_ops = get_ops();
+        sl.decode_available_map.resize(sl.n_expert, -1);
+    }
+
+    gpu_decode = enabled && common_backend != nullptr;
+    gpu_decode_continuous = gpu_decode && gpu_decode_continuous_requested;
+    if (gpu_decode_continuous) {
+        for (const auto & layer_ptr : layers) {
+            if (layer_ptr && layer_ptr->decode_ops != nullptr &&
+                    (layer_ptr->decode_ops->supports_continuous == nullptr ||
+                     !layer_ptr->decode_ops->supports_continuous(layer_ptr->decode_backend) ||
+                     layer_ptr->decode_ops->continuous_begin == nullptr ||
+                     layer_ptr->decode_ops->continuous_wait == nullptr ||
+                     layer_ptr->decode_ops->continuous_resume == nullptr ||
+                     layer_ptr->decode_ops->continuous_status == nullptr ||
+                     layer_ptr->decode_ops->continuous_end == nullptr)) {
+                gpu_decode_continuous = false;
+                break;
+            }
+        }
+    }
+    if (gpu_decode) {
+        LLAMA_LOG_INFO("%s: Stream MoE GPU decode planner enabled\n", __func__);
+        if (gpu_decode_continuous) {
+            LLAMA_LOG_INFO("%s: Stream MoE continuous GPU decode enabled\n", __func__);
+        } else if (gpu_decode_continuous_requested) {
+            LLAMA_LOG_WARN("%s: continuous GPU decode requested, but the backend does not support it\n", __func__);
+        }
+    } else {
+        unbind_decode_backends();
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_STREAM_GPU_DECODE requested, but the streamed layers do not share one supported backend\n",
+                __func__);
+    }
+}
+
+void llama_moe_stream::unbind_decode_backends() {
+    gpu_decode = false;
+    gpu_decode_continuous = false;
+    gpu_decode_state_ready = false;
+    gpu_decode_cpu_policy_stale = false;
+    for (auto & layer_ptr : layers) {
+        if (!layer_ptr) {
+            continue;
+        }
+        layer_ptr->decode_backend = nullptr;
+        layer_ptr->decode_ops = nullptr;
+        layer_ptr->decode_available_map.clear();
+    }
+}
+
+void llama_moe_stream::record_continuous_hits(size_t n_plans) {
+    if (n_plans == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    stats.n_calls += n_plans;
+    gpu_decode_cpu_policy_stale = true;
+    if (token_stats_active) {
+        token_stats.n_hit += n_plans;
+    }
+}
+
+bool llama_moe_stream::prepare_decode() {
+    if (!gpu_decode) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (gpu_decode_state_ready) {
+        return true;
+    }
+    if (!sync_decode_policy_locked()) {
+        return false;
+    }
+
+    for (auto & layer_ptr : layers) {
+        if (!layer_ptr) {
+            continue;
+        }
+        auto & sl = *layer_ptr;
+        if (sl.decode_backend == nullptr || sl.decode_ops == nullptr) {
+            return false;
+        }
+
+        refresh_expert_map_locked(sl);
+        std::fill(sl.decode_available_map.begin(), sl.decode_available_map.end(), -1);
+        for (const auto & entry : sl.expert_slot) {
+            sl.decode_available_map[entry.first] = entry.second;
+        }
+
+        const ggml_backend_moe_stream_cache_state state = {
+            /* .layer              = */ sl.il,
+            /* .n_expert           = */ sl.n_expert,
+            /* .n_slots            = */ sl.n_slots,
+            /* .expert_map         = */ sl.expert_map.data(),
+            /* .available_map      = */ sl.decode_available_map.data(),
+            /* .slot_expert        = */ sl.slot_expert.data(),
+            /* .slot_state         = */ sl.slot_state.data(),
+            /* .route_hotness      = */ sl.route_hotness.data(),
+            /* .slot_last_use      = */ sl.slot_last_use.data(),
+            /* .use_counter        = */ (uint64_t) sl.use_counter,
+            /* .n_calls            = */ stats.n_calls,
+            /* .hot_decay_interval = */ hot_decay_interval,
+        };
+        if (!sl.decode_ops->sync(sl.decode_backend, &state)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize GPU decode state for layer %d\n", __func__, sl.il);
+            return false;
+        }
+    }
+
+    gpu_decode_state_ready = true;
+    gpu_decode_cpu_policy_stale = false;
+    return true;
+}
+
+bool llama_moe_stream::sync_decode_policy_locked() {
+    if (!gpu_decode_cpu_policy_stale) {
+        return true;
+    }
+
+    for (auto & layer_ptr : layers) {
+        if (!layer_ptr) {
+            continue;
+        }
+        auto & sl = *layer_ptr;
+        if (sl.decode_backend == nullptr || sl.decode_ops == nullptr || sl.decode_ops->read_policy == nullptr) {
+            return false;
+        }
+
+        uint64_t use_counter = 0;
+        if (!sl.decode_ops->read_policy(
+                    sl.decode_backend,
+                    sl.il,
+                    sl.route_hotness.data(),
+                    sl.route_hotness.size(),
+                    sl.slot_last_use.data(),
+                    sl.slot_last_use.size(),
+                    &use_counter)) {
+            LLAMA_LOG_ERROR("%s: failed to read GPU decode policy for layer %d\n", __func__, sl.il);
+            return false;
+        }
+        sl.use_counter = (int64_t) use_counter;
+    }
+
+    gpu_decode_cpu_policy_stale = false;
+    return true;
 }
 
 void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
@@ -337,19 +569,34 @@ void llama_moe_stream::worker_loop() {
         }
         sl.slot_claimed[w.slot] = 1;
 
+        const int64_t queue_us = w.queued_us > 0 ? ggml_time_us() - w.queued_us : 0;
+        int64_t read_us = 0;
+        int64_t upload_us = 0;
+
         lk.unlock();
 
         bool ok = true;
         for (const auto & wt : sl.weights) {
+            const int64_t read_start_us = ggml_time_us();
             const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+            read_us += ggml_time_us() - read_start_us;
             if (data == nullptr) {
                 ok = false;
                 break;
             }
+            const int64_t upload_start_us = ggml_time_us();
             ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            upload_us += ggml_time_us() - upload_start_us;
         }
 
         lk.lock();
+
+        if (token_stats_active) {
+            token_stats.n_worker_loads++;
+            token_stats.t_worker_queue_us += queue_us;
+            token_stats.t_worker_read_us += read_us;
+            token_stats.t_worker_upload_us += upload_us;
+        }
 
         sl.slot_claimed[w.slot] = 0;
         if (!ok) {
@@ -392,7 +639,8 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
 
 // bind expert -> slot and mark it LOADING: evict the slot's prior occupant, bump slot_gen (so any
 // in-flight load for the old occupant is recognized as stale), and update the expert_slot index
-void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
+void llama_moe_stream::reserve_slot_locked(
+        llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool update_policy) {
     if (sl.slot_expert[slot] >= 0) {
         if (debug) {
             LLAMA_LOG_DEBUG("%s: layer %d: evict expert %d from slot %d\n", __func__, sl.il, sl.slot_expert[slot], slot);
@@ -403,7 +651,9 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
     sl.slot_expert[slot] = expert;
     sl.slot_state[slot]  = LLAMA_MOE_STREAM_SLOT_LOADING;
     sl.slot_gen[slot]++;
-    sl.slot_last_use[slot] = ++sl.use_counter;
+    if (update_policy) {
+        sl.slot_last_use[slot] = ++sl.use_counter;
+    }
     sl.expert_slot[expert] = slot;
     sl.seen[expert] = 1;
 }
@@ -495,8 +745,19 @@ bool llama_moe_stream::build_plan_locked(
 }
 
 void llama_moe_stream::apply_plan_locked(
-        std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl) {
+        std::unique_lock<std::mutex> & lk,
+        llama_moe_stream_layer & sl,
+        size_t n_required,
+        bool update_policy,
+        int64_t * resident_wait_us) {
     auto & plan = sl.plan;
+    if (resident_wait_us != nullptr) {
+        *resident_wait_us = 0;
+    }
+    if (n_required == SIZE_MAX) {
+        n_required = sl.uniq.size();
+    }
+    GGML_ASSERT(n_required >= plan.loads.size());
 
     for (const auto & load : plan.loads) {
         GGML_ASSERT(load.expert >= 0 && (uint32_t) load.expert < sl.n_expert);
@@ -506,17 +767,17 @@ void llama_moe_stream::apply_plan_locked(
         if (!sl.seen[load.expert]) {
             stats.n_miss_cold++;
         }
-        reserve_slot_locked(sl, load.expert, load.slot);
+        reserve_slot_locked(sl, load.expert, load.slot, update_policy);
     }
 
     stats.n_miss += plan.loads.size();
-    stats.n_hit  += sl.uniq.size() - plan.loads.size();
+    stats.n_hit  += n_required - plan.loads.size();
 
     bool waited = false;
     for (const int32_t slot : plan.required_slots) {
         GGML_ASSERT(slot >= 0 && (uint32_t) slot < sl.n_slots);
         if (sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-            q_demand.push_back({ &sl, sl.slot_expert[slot], slot, sl.slot_gen[slot] });
+            q_demand.push_back({ &sl, sl.slot_expert[slot], slot, sl.slot_gen[slot], ggml_time_us() });
             cv_work.notify_one();
             waited = true;
         }
@@ -541,7 +802,11 @@ void llama_moe_stream::apply_plan_locked(
     if (load_failed) {
         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
     }
-    stats.t_stall_us += ggml_time_us() - t0;
+    const int64_t elapsed_us = ggml_time_us() - t0;
+    stats.t_stall_us += elapsed_us;
+    if (resident_wait_us != nullptr) {
+        *resident_wait_us = elapsed_us;
+    }
 }
 
 void llama_moe_stream::commit_plan_locked(
@@ -639,6 +904,292 @@ void llama_moe_stream::print_stats() const {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
     }
+    if (stats.n_shadow_plans > 0) {
+        LLAMA_LOG_INFO("%s: moe stream shadow: plans = %" PRId64 ", matched = %" PRId64 ", mismatched = %" PRId64 "\n",
+                __func__, stats.n_shadow_plans, stats.n_shadow_plans - stats.n_shadow_mismatches,
+                stats.n_shadow_mismatches);
+    }
+}
+
+static bool llama_moe_stream_shadow_prepare(
+        llama_moe_stream_layer & sl,
+        const ggml_tensor * selected) {
+    auto * mgr = sl.mgr;
+    if (!mgr->shadow || sl.shadow_backend == nullptr || sl.shadow_ops == nullptr) {
+        return false;
+    }
+
+    std::fill(sl.shadow_available_map.begin(), sl.shadow_available_map.end(), -1);
+    for (const auto & entry : sl.expert_slot) {
+        sl.shadow_available_map[entry.first] = entry.second;
+    }
+
+    const ggml_backend_moe_stream_cache_state state = {
+        /* .layer           = */ sl.il,
+        /* .n_expert        = */ sl.n_expert,
+        /* .n_slots         = */ sl.n_slots,
+        /* .expert_map      = */ sl.expert_map.data(),
+        /* .available_map   = */ sl.shadow_available_map.data(),
+        /* .slot_expert     = */ sl.slot_expert.data(),
+        /* .slot_state      = */ sl.slot_state.data(),
+        /* .route_hotness   = */ sl.route_hotness.data(),
+        /* .slot_last_use   = */ sl.slot_last_use.data(),
+        /* .use_counter     = */ (uint64_t) sl.use_counter,
+        /* .n_calls         = */ mgr->stats.n_calls,
+        /* .hot_decay_interval = */ mgr->hot_decay_interval,
+    };
+
+    mgr->stats.n_shadow_plans++;
+    if (mgr->token_stats_active) {
+        mgr->token_stats.n_shadow_plans++;
+    }
+    if (!sl.shadow_ops->sync(sl.shadow_backend, &state)) {
+        mgr->stats.n_shadow_mismatches++;
+        if (mgr->token_stats_active) {
+            mgr->token_stats.n_shadow_mismatches++;
+        }
+        LLAMA_LOG_ERROR("%s: layer %d: GPU state synchronization failed\n", __func__, sl.il);
+        return false;
+    }
+
+    ggml_backend_moe_stream_cache_plan gpu = {};
+    if (!sl.shadow_ops->prepare(sl.shadow_backend, selected, &gpu)) {
+        mgr->stats.n_shadow_mismatches++;
+        if (mgr->token_stats_active) {
+            mgr->token_stats.n_shadow_mismatches++;
+        }
+        LLAMA_LOG_ERROR("%s: layer %d: GPU prepare failed\n", __func__, sl.il);
+        sl.shadow_ops->abort(sl.shadow_backend, sl.il);
+        return false;
+    }
+
+    const auto & cpu = sl.plan;
+    const char * mismatch = nullptr;
+    size_t mismatch_index = 0;
+    int32_t cpu_value = 0;
+    int32_t gpu_value = 0;
+
+    if (gpu.n_loads != cpu.loads.size()) {
+        mismatch = "n_loads";
+        cpu_value = (int32_t) cpu.loads.size();
+        gpu_value = (int32_t) gpu.n_loads;
+    } else {
+        for (size_t i = 0; i < cpu.loads.size() && mismatch == nullptr; ++i) {
+            const int32_t cpu_load[3] = { cpu.loads[i].expert, cpu.loads[i].victim, cpu.loads[i].slot };
+            const int32_t gpu_load[3] = { gpu.loads[i].expert, gpu.loads[i].victim, gpu.loads[i].slot };
+            for (size_t field = 0; field < 3; ++field) {
+                if (cpu_load[field] != gpu_load[field]) {
+                    mismatch = field == 0 ? "loads.expert" : field == 1 ? "loads.victim" : "loads.slot";
+                    mismatch_index = i;
+                    cpu_value = cpu_load[field];
+                    gpu_value = gpu_load[field];
+                    break;
+                }
+            }
+        }
+    }
+
+    if (mismatch == nullptr && gpu.n_mapped_topk != cpu.mapped_topk.size()) {
+        mismatch = "mapped_topk.size";
+        cpu_value = (int32_t) cpu.mapped_topk.size();
+        gpu_value = (int32_t) gpu.n_mapped_topk;
+    }
+    for (size_t i = 0; i < cpu.mapped_topk.size() && mismatch == nullptr; ++i) {
+        if (cpu.mapped_topk[i] != gpu.mapped_topk[i]) {
+            mismatch = "mapped_topk";
+            mismatch_index = i;
+            cpu_value = cpu.mapped_topk[i];
+            gpu_value = gpu.mapped_topk[i];
+        }
+    }
+
+    if (mismatch == nullptr && gpu.n_next_map != cpu.next_map.size()) {
+        mismatch = "next_map.size";
+        cpu_value = (int32_t) cpu.next_map.size();
+        gpu_value = (int32_t) gpu.n_next_map;
+    }
+    for (size_t i = 0; i < cpu.next_map.size() && mismatch == nullptr; ++i) {
+        if (cpu.next_map[i] != gpu.next_map[i]) {
+            mismatch = "next_map";
+            mismatch_index = i;
+            cpu_value = cpu.next_map[i];
+            gpu_value = gpu.next_map[i];
+        }
+    }
+
+    if (mismatch != nullptr) {
+        mgr->stats.n_shadow_mismatches++;
+        if (mgr->token_stats_active) {
+            mgr->token_stats.n_shadow_mismatches++;
+        }
+        LLAMA_LOG_ERROR("%s: layer %d: %s mismatch at %zu: cpu=%d gpu=%d\n",
+                __func__, sl.il, mismatch, mismatch_index, cpu_value, gpu_value);
+        sl.shadow_ops->abort(sl.shadow_backend, sl.il);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_moe_stream::eval_callback(
+        ggml_backend_sched_t sched,
+        ggml_tensor * tensor,
+        bool ask,
+        bool & requested) {
+    requested = false;
+    if (!gpu_decode || tensor == nullptr || tensor->op != GGML_OP_MOE_STREAM_CACHE_DECIDE) {
+        return true;
+    }
+
+    int32_t layer_id = -1;
+    memcpy(&layer_id, tensor->op_params, sizeof(layer_id));
+    llama_moe_stream_layer * sl = layer(layer_id);
+    if (sl == nullptr || sl->decode_backend == nullptr || sl->decode_ops == nullptr) {
+        LLAMA_LOG_ERROR("%s: invalid GPU decode layer %d\n", __func__, layer_id);
+        gpu_decode_state_ready = false;
+        return false;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+    if (backend != sl->decode_backend) {
+        LLAMA_LOG_ERROR("%s: layer %d cache planner was assigned to an unexpected backend\n",
+                __func__, layer_id);
+        gpu_decode_state_ready = false;
+        return false;
+    }
+
+    requested = true;
+    if (ask) {
+        return true;
+    }
+
+    const int64_t callback_start_us = ggml_time_us();
+    const int64_t sync_us = ggml_backend_sched_get_last_eval_callback_sync_us(sched);
+    const int64_t segment_us = ggml_backend_sched_get_last_eval_callback_segment_us(sched);
+    ggml_backend_moe_stream_cache_plan gpu = {};
+    const int64_t prepare_start_us = ggml_time_us();
+    if (!sl->decode_ops->prepare(backend, tensor, &gpu)) {
+        LLAMA_LOG_ERROR("%s: GPU decode prepare failed for layer %d\n", __func__, layer_id);
+        gpu_decode_state_ready = false;
+        return false;
+    }
+    const int64_t prepare_us = ggml_time_us() - prepare_start_us;
+    const auto abort_plan = [&] {
+        sl->decode_ops->abort(backend, layer_id);
+        gpu_decode_state_ready = false;
+    };
+
+    const bool slow_path = gpu.n_loads > 0 || gpu.n_waiting > 0;
+    if (gpu.n_required == 0 || gpu.n_required > sl->n_slots ||
+            gpu.n_loads > gpu.n_required || gpu.n_waiting > gpu.n_required ||
+            (gpu.n_loads > 0 && gpu.loads == nullptr) ||
+            (slow_path &&
+             (gpu.required_slots == nullptr || gpu.n_required_slots != gpu.n_required))) {
+        LLAMA_LOG_ERROR("%s: GPU decode returned an invalid plan for layer %d\n", __func__, layer_id);
+        abort_plan();
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lk(mtx);
+    if (load_failed) {
+        LLAMA_LOG_ERROR("%s: expert loading previously failed\n", __func__);
+        abort_plan();
+        return false;
+    }
+    if (token_stats_active && gpu.n_gpu_commit_carry > 0) {
+        token_stats.n_gpu_commit_carry += gpu.n_gpu_commit_carry;
+        token_stats.t_gpu_commit_carry_ns += gpu.t_gpu_commit_carry_ns;
+    }
+
+    stats.n_calls++;
+    gpu_decode_cpu_policy_stale = true;
+    if (token_stats_active) {
+        if (slow_path) {
+            token_stats.n_miss++;
+        } else {
+            token_stats.n_hit++;
+        }
+    }
+
+    auto & plan = sl->plan;
+    plan.loads.clear();
+    plan.next_map.clear();
+    plan.mapped_topk.clear();
+    plan.required_slots.clear();
+    int64_t load_us = 0;
+    int64_t resident_wait_us = 0;
+
+    if (slow_path) {
+        start_workers_locked();
+        plan.loads.reserve(gpu.n_loads);
+        for (size_t i = 0; i < gpu.n_loads; ++i) {
+            if (gpu.loads[i].expert < 0 || (uint32_t) gpu.loads[i].expert >= sl->n_expert ||
+                    gpu.loads[i].slot < 0 || (uint32_t) gpu.loads[i].slot >= sl->n_slots ||
+                    gpu.loads[i].victim < -1 ||
+                    (gpu.loads[i].victim >= 0 && (uint32_t) gpu.loads[i].victim >= sl->n_expert)) {
+                LLAMA_LOG_ERROR("%s: GPU decode returned an invalid load for layer %d\n", __func__, layer_id);
+                abort_plan();
+                return false;
+            }
+            plan.loads.push_back({ gpu.loads[i].expert, gpu.loads[i].victim, gpu.loads[i].slot });
+        }
+        std::fill(sl->keep.begin(), sl->keep.end(), 0);
+        for (size_t i = 0; i < gpu.n_required_slots; ++i) {
+            const int32_t slot = gpu.required_slots[i];
+            if (slot < 0 || (uint32_t) slot >= sl->n_slots) {
+                LLAMA_LOG_ERROR("%s: GPU decode returned an invalid mapped slot for layer %d\n",
+                        __func__, layer_id);
+                abort_plan();
+                return false;
+            }
+            if (!sl->keep[slot]) {
+                sl->keep[slot] = 1;
+                plan.required_slots.push_back(slot);
+            }
+        }
+        if (plan.required_slots.size() != gpu.n_required) {
+            LLAMA_LOG_ERROR("%s: GPU decode required slot count mismatch for layer %d\n", __func__, layer_id);
+            abort_plan();
+            return false;
+        }
+        const int64_t load_start_us = ggml_time_us();
+        apply_plan_locked(lk, *sl, gpu.n_required, false, &resident_wait_us);
+        load_us = ggml_time_us() - load_start_us;
+    } else {
+        stats.n_hit += gpu.n_required;
+    }
+
+    const int64_t commit_start_us = ggml_time_us();
+    if (!sl->decode_ops->commit(backend, layer_id)) {
+        LLAMA_LOG_ERROR("%s: GPU decode commit failed for layer %d\n", __func__, layer_id);
+        abort_plan();
+        return false;
+    }
+    const int64_t commit_us = ggml_time_us() - commit_start_us;
+    if (!slow_path && token_stats_active) {
+        token_stats.n_gpu_hit_plans++;
+        token_stats.t_gpu_hit_segment_ns += gpu.t_gpu_segment_ns;
+        token_stats.t_gpu_hit_planner_ns += gpu.t_gpu_planner_ns;
+        token_stats.t_gpu_hit_wall_us += segment_us;
+        token_stats.t_gpu_hit_sync_us += sync_us;
+        token_stats.t_gpu_hit_cb_us += ggml_time_us() - callback_start_us;
+        token_stats.t_gpu_hit_prepare_us += prepare_us;
+        token_stats.t_gpu_hit_commit_us += commit_us;
+    } else if (slow_path && token_stats_active) {
+        token_stats.n_gpu_slow_plans++;
+        token_stats.n_gpu_slow_loads += gpu.n_loads;
+        token_stats.t_gpu_slow_segment_ns += gpu.t_gpu_segment_ns;
+        token_stats.t_gpu_slow_planner_ns += gpu.t_gpu_planner_ns;
+        token_stats.t_gpu_slow_wall_us += segment_us;
+        token_stats.t_gpu_slow_sync_us += sync_us;
+        token_stats.t_gpu_slow_cb_us += ggml_time_us() - callback_start_us;
+        token_stats.t_gpu_slow_prepare_us += prepare_us;
+        token_stats.t_gpu_slow_load_us += load_us;
+        token_stats.t_gpu_slow_commit_us += commit_us;
+        token_stats.n_gpu_slow_waiting += gpu.n_waiting;
+        token_stats.t_gpu_slow_resident_wait_us += resident_wait_us;
+    }
+    return true;
 }
 
 // custom-op callback (single-threaded on ith 0): given the router's expert ids, ensure every touched
@@ -665,6 +1216,10 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
           int32_t * out = (int32_t *) dst->data;
 
     std::unique_lock<std::mutex> lk(mgr->mtx);
+    if (!mgr->sync_decode_policy_locked()) {
+        GGML_ABORT("MoE expert streaming: failed to synchronize the GPU cache policy");
+    }
+    mgr->gpu_decode_state_ready = false;
 
     if (mgr->load_failed) {
         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
@@ -714,8 +1269,17 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
+    const bool shadow_pending = llama_moe_stream_shadow_prepare(*sl, a);
     mgr->apply_plan_locked(lk, *sl);
     mgr->commit_plan_locked(*sl, ids, out, n);
+    if (shadow_pending && !sl->shadow_ops->commit(sl->shadow_backend, sl->il)) {
+        mgr->stats.n_shadow_mismatches++;
+        if (mgr->token_stats_active) {
+            mgr->token_stats.n_shadow_mismatches++;
+        }
+        LLAMA_LOG_ERROR("%s: layer %d: GPU commit failed\n", __func__, sl->il);
+        sl->shadow_ops->abort(sl->shadow_backend, sl->il);
+    }
 }
 
 // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
@@ -734,6 +1298,10 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
 // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split them
 // into consecutive groups of plan_capacity, one group per wave (sl.expert_wave[e] = e's wave)
 void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
+    if (!sync_decode_policy_locked()) {
+        GGML_ABORT("MoE expert streaming: failed to synchronize the GPU cache policy");
+    }
+    gpu_decode_state_ready = false;
     stats.n_calls++;
     start_workers_locked();
 
@@ -800,7 +1368,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // already in the cache (resident, or still loading from the previous wave's preload)
                 const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s] }); // promote to demand, wait for it
+                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s], ggml_time_us() }); // promote to demand, wait for it
                     cv_work.notify_one();
                     waited = true;
                 } else {
@@ -822,7 +1390,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                     stats.n_miss_cold++;
                 }
                 reserve_slot_locked(sl, e, v);
-                q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+                q_demand.push_back({ &sl, e, v, sl.slot_gen[v], ggml_time_us() });
                 cv_work.notify_one();
                 stats.n_miss++;
                 waited = true;
@@ -849,7 +1417,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             }
             reserve_slot_locked(sl, e, v);
             sl.keep[v] = 1;
-            q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+            q_demand.push_back({ &sl, e, v, sl.slot_gen[v], ggml_time_us() });
             cv_work.notify_one();
             stats.n_preload_issued++;
         }

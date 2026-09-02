@@ -705,6 +705,9 @@ struct vk_device_struct {
     bool shader_int64;
     bool buffer_device_address;
     bool vulkan_memory_model;
+    bool conditional_rendering;
+    PFN_vkCmdBeginConditionalRenderingEXT pfn_vkCmdBeginConditionalRenderingEXT {};
+    PFN_vkCmdEndConditionalRenderingEXT pfn_vkCmdEndConditionalRenderingEXT {};
 
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
@@ -960,6 +963,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_moe_stream_cache_plan;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1224,6 +1228,15 @@ struct vk_op_count_experts_push_constants {
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
+};
+
+struct vk_moe_stream_cache_push_constants {
+    uint32_t n_expert;
+    uint32_t n_slots;
+    uint32_t n_selected;
+    uint32_t mode;
+    uint32_t decay;
+    int32_t layer;
 };
 
 struct vk_op_glu_push_constants {
@@ -2091,6 +2104,78 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_moe_stream_cache_layer_state {
+    uint32_t n_expert {};
+    uint32_t n_slots {};
+    vk_buffer expert_map;
+    vk_buffer available_map;
+    vk_buffer slot_expert;
+    vk_buffer slot_state;
+    vk_buffer route_hotness;
+    vk_buffer slot_last_use;
+    vk_buffer use_counter;
+};
+
+struct vk_moe_stream_cache_state {
+    std::vector<vk_moe_stream_cache_layer_state> layers;
+
+    uint32_t n_expert_capacity {};
+    uint32_t n_selected_capacity {};
+    vk_buffer selected;
+    vk_buffer next_map;
+    vk_buffer plan_loads;
+    vk_buffer mapped_topk;
+    vk_buffer plan_meta;
+    vk_buffer plan_meta_readback;
+
+    std::vector<ggml_backend_moe_stream_cache_load> host_loads;
+    std::vector<int32_t> host_required_slots;
+    std::vector<int32_t> host_mapped_topk;
+    std::vector<int32_t> host_next_map;
+    std::vector<uint32_t> host_slot_state;
+    std::vector<uint32_t> host_slot_last_use;
+    int32_t synced_layer = -1;
+    int32_t pending_layer = -1;
+    int64_t n_calls {};
+    int64_t hot_decay_interval {};
+    bool plan_pending {};
+    bool pending_graph_plan {};
+    bool pending_slow_path {};
+    bool commit_timing_pending {};
+    bool continuous_active {};
+    bool continuous_recording {};
+    bool pending_continuous_plan {};
+    int32_t continuous_miss_layer = -1;
+    int32_t continuous_capture_layer = -1;
+    size_t continuous_resume_plan = 0;
+    std::vector<std::pair<int32_t, int64_t>> continuous_planner_calls;
+    std::vector<std::pair<vk_command_buffer *, int32_t>> continuous_commands;
+
+    ~vk_moe_stream_cache_state() {
+        for (auto & layer : layers) {
+            ggml_vk_destroy_buffer(layer.expert_map);
+            ggml_vk_destroy_buffer(layer.available_map);
+            ggml_vk_destroy_buffer(layer.slot_expert);
+            ggml_vk_destroy_buffer(layer.slot_state);
+            ggml_vk_destroy_buffer(layer.route_hotness);
+            ggml_vk_destroy_buffer(layer.slot_last_use);
+            ggml_vk_destroy_buffer(layer.use_counter);
+        }
+        ggml_vk_destroy_buffer(selected);
+        ggml_vk_destroy_buffer(next_map);
+        ggml_vk_destroy_buffer(plan_loads);
+        ggml_vk_destroy_buffer(mapped_topk);
+        ggml_vk_destroy_buffer(plan_meta);
+        ggml_vk_destroy_buffer(plan_meta_readback);
+    }
+};
+
+static constexpr size_t VK_MOE_STREAM_META_COUNT = 8;
+static constexpr vk::DeviceSize VK_MOE_STREAM_HIT_PREDICATE_OFFSET =
+        6 * sizeof(int32_t);
+static constexpr size_t VK_MOE_STREAM_META_BUFFER_SIZE =
+        VK_MOE_STREAM_META_COUNT * sizeof(int32_t);
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2153,6 +2238,10 @@ struct ggml_backend_vk_context {
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
+
+    vk_moe_stream_cache_state moe_stream_cache;
+    vk::QueryPool moe_stream_query_pool;
+    vk::QueryPool moe_stream_commit_query_pool;
     vk::QueryPool query_pool;
     std::vector<const char *> query_fusion_names;
     std::vector<int> query_fusion_node_count;
@@ -3082,7 +3171,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 }
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, vk::BufferUsageFlags extra_usage = {}) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -3095,7 +3184,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         return buf;
     }
 
-    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+                                       vk::BufferUsageFlagBits::eTransferDst | extra_usage;
     vk::MemoryAllocateFlags mem_flags {};
     if (device->buffer_device_address) {
         usage_flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
@@ -3248,34 +3338,35 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
     }
 }
 
-static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
+static vk_buffer ggml_vk_create_buffer_device(
+        vk_device & device, size_t size, vk::BufferUsageFlags extra_usage = {}) {
     vk_buffer buf;
     try {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
+                                                       vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, extra_usage);
         } else if (device->uma) {
             // On UMA, prefer host-visible memory so direct tensor borrowing works.
             // If unavailable, fall back to device-local memory.
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, extra_usage);
         } else if (device->disable_host_visible_vidmem) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, extra_usage);
             } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, extra_usage);
             }
         } else {
             // use rebar if available, otherwise fallback to device only visible memory
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                            vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, extra_usage);
             } else {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, extra_usage);
             }
         }
     } catch (const vk::SystemError& e) {
@@ -5379,6 +5470,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_moe_stream_cache_plan,
+            "moe_stream_cache_plan", moe_stream_cache_plan_len, moe_stream_cache_plan_data,
+            "main", 12, sizeof(vk_moe_stream_cache_push_constants), {1, 1, 1}, {}, 1, true);
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -5790,6 +5884,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool coopmat2_support = false;
         bool coopmat2_decode_vector_support = false;
         bool pipeline_executable_properties_support = false;
+        bool conditional_rendering_support = false;
         device->coopmat_support = false;
         device->integer_dot_product = false;
         device->shader_64b_indexing = false;
@@ -5809,6 +5904,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 amd_shader_core_properties2 = true;
             } else if (strcmp("VK_EXT_pipeline_robustness", properties.extensionName) == 0) {
                 pipeline_robustness = true;
+            } else if (strcmp(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, properties.extensionName) == 0) {
+                conditional_rendering_support = true;
             } else if (strcmp("VK_EXT_subgroup_size_control", properties.extensionName) == 0) {
                 device->subgroup_size_control = true;
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -6076,6 +6173,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_pipeline_robustness");
         }
 
+        VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering_features {};
+        conditional_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT;
+        if (conditional_rendering_support) {
+            last_struct->pNext = (VkBaseOutStructure *) &conditional_rendering_features;
+            last_struct = (VkBaseOutStructure *) &conditional_rendering_features;
+            device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+        }
+
         VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features;
         memory_priority_features.pNext = nullptr;
         memory_priority_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
@@ -6200,6 +6305,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->dot2_f16 = dot2_f16_support && dot2_features.shaderMixedFloatDotProductFloat16AccFloat32;
 
         device->pipeline_robustness = pl_robustness_features.pipelineRobustness;
+        device->conditional_rendering = conditional_rendering_support &&
+                conditional_rendering_features.conditionalRendering;
 
         device->multi_add = vk12_props.shaderRoundingModeRTEFloat16 &&
                             device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
@@ -6464,6 +6571,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+        if (device->conditional_rendering) {
+            device->pfn_vkCmdBeginConditionalRenderingEXT =
+                    (PFN_vkCmdBeginConditionalRenderingEXT) vkGetDeviceProcAddr(
+                            device->device, "vkCmdBeginConditionalRenderingEXT");
+            device->pfn_vkCmdEndConditionalRenderingEXT =
+                    (PFN_vkCmdEndConditionalRenderingEXT) vkGetDeviceProcAddr(
+                            device->device, "vkCmdEndConditionalRenderingEXT");
+            device->conditional_rendering = device->pfn_vkCmdBeginConditionalRenderingEXT != nullptr &&
+                    device->pfn_vkCmdEndConditionalRenderingEXT != nullptr;
+        }
 
         // Queues
         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
@@ -7658,13 +7775,13 @@ static void ggml_vk_ctx_end(vk_context& ctx) {
     ctx->s = nullptr;
 }
 
-static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
+static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx, bool one_time = true) {
     VK_LOG_DEBUG("ggml_vk_ctx_begin(" << device->name << ")");
     if (subctx->s != nullptr) {
         ggml_vk_ctx_end(subctx);
     }
 
-    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
+    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, one_time) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
 }
 
@@ -7676,7 +7793,7 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
         result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
 
         ctx->compute_ctx = result;
-        ggml_vk_ctx_begin(ctx->device, result);
+        ggml_vk_ctx_begin(ctx->device, result, !ctx->moe_stream_cache.continuous_recording);
     }
 
     if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
@@ -14485,10 +14602,54 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
+static bool ggml_vk_moe_stream_cache_decide(
+        ggml_backend_vk_context * ctx,
+        vk_context & compute_ctx,
+        const ggml_tensor * selected,
+        ggml_tensor * mapped_topk);
+
+static bool ggml_vk_moe_stream_conditional_gemm(
+        const ggml_backend_vk_context * ctx, const ggml_tensor * node) {
+    return ctx->device->conditional_rendering && ctx->moe_stream_cache.plan_meta != nullptr &&
+            node->op == GGML_OP_MUL_MAT_ID && node->src[2] != nullptr &&
+            node->src[2]->op == GGML_OP_MOE_STREAM_CACHE_DECIDE;
+}
+
+static void ggml_vk_moe_stream_begin_conditional(
+        ggml_backend_vk_context * ctx, vk_context & compute_ctx) {
+    auto & cache = ctx->moe_stream_cache;
+    compute_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eConditionalRenderingEXT,
+            {},
+            { { vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eConditionalRenderingReadEXT } },
+            {}, {});
+
+    VkConditionalRenderingBeginInfoEXT begin_info {};
+    begin_info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+    begin_info.buffer = cache.plan_meta->buffer;
+    begin_info.offset = VK_MOE_STREAM_HIT_PREDICATE_OFFSET;
+    ctx->device->pfn_vkCmdBeginConditionalRenderingEXT(compute_ctx->s->buffer->buf, &begin_info);
+}
+
+static void ggml_vk_moe_stream_end_conditional(
+        ggml_backend_vk_context * ctx, vk_context & compute_ctx) {
+    ctx->device->pfn_vkCmdEndConditionalRenderingEXT(compute_ctx->s->buffer->buf);
+}
 
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
-static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+static bool ggml_vk_build_graph(
+        ggml_backend_vk_context * ctx,
+        ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_tensor * node_begin,
+        int node_idx_begin,
+        bool last_node,
+        bool almost_ready,
+        bool submit,
+        bool conditional_execution) {
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
         return false;
@@ -14623,6 +14784,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
             std::cerr << std::endl;
         }
+    }
+
+    const bool conditional = conditional_execution || ggml_vk_moe_stream_conditional_gemm(ctx, node);
+    if (conditional) {
+        ggml_vk_moe_stream_begin_conditional(ctx, compute_ctx);
     }
 
     switch (node->op) {
@@ -14854,6 +15020,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
 
         break;
+    case GGML_OP_MOE_STREAM_CACHE_DECIDE:
+        if (!ggml_vk_moe_stream_cache_decide(ctx, compute_ctx, src0, node)) {
+            return false;
+        }
+
+        break;
     case GGML_OP_TOP_K:
         ggml_vk_topk(ctx, compute_ctx, src0, node);
 
@@ -14976,7 +15148,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     default:
+        if (conditional) {
+            ggml_vk_moe_stream_end_conditional(ctx, compute_ctx);
+        }
         return false;
+    }
+
+    if (conditional) {
+        ggml_vk_moe_stream_end_conditional(ctx, compute_ctx);
     }
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
@@ -15018,6 +15197,20 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_check_results_0(ctx, cgraph, tensor_idx);
 #endif
+
+        if (ctx->moe_stream_cache.continuous_recording) {
+            const size_t first = ctx->moe_stream_cache.continuous_commands.size();
+            for (const auto & sequence : subctx->seqs) {
+                for (const auto & submission : sequence) {
+                    ctx->moe_stream_cache.continuous_commands.emplace_back(submission.buffer, -1);
+                }
+            }
+            if (ctx->moe_stream_cache.continuous_capture_layer >= 0) {
+                GGML_ASSERT(ctx->moe_stream_cache.continuous_commands.size() > first);
+                ctx->moe_stream_cache.continuous_commands.back().second =
+                        ctx->moe_stream_cache.continuous_capture_layer;
+            }
+        }
 
         // Do staging buffer copies
         for (auto& cpy : subctx->in_memcpys) {
@@ -15123,6 +15316,14 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    if (ctx->moe_stream_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->moe_stream_query_pool);
+        ctx->moe_stream_query_pool = nullptr;
+    }
+    if (ctx->moe_stream_commit_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->moe_stream_commit_query_pool);
+        ctx->moe_stream_commit_query_pool = nullptr;
+    }
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -16300,6 +16501,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
+    const bool moe_stream_continuous = ctx->moe_stream_cache.continuous_recording;
+    bool moe_stream_guarded = false;
+    if (!moe_stream_continuous && cgraph->nodes[last_node]->op == GGML_OP_MOE_STREAM_CACHE_DECIDE) {
+        if (!ctx->moe_stream_query_pool) {
+            vk::QueryPoolCreateInfo query_create_info;
+            query_create_info.queryType = vk::QueryType::eTimestamp;
+            query_create_info.queryCount = 3;
+            ctx->moe_stream_query_pool = ctx->device->device.createQueryPool(query_create_info);
+        }
+        ctx->device->device.resetQueryPool(ctx->moe_stream_query_pool, 0, 3);
+        compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 0);
+    }
+
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of compute work using flops, and submit every 200 GFLOP
     // (and scaled down based on total graph flops, so smaller models submit earlier).
@@ -16529,12 +16745,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        const bool moe_stream_decision = cgraph->nodes[i]->op == GGML_OP_MOE_STREAM_CACHE_DECIDE;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending);
+                      (almost_ready && !ctx->almost_ready_fence_pending) ||
+                      (moe_stream_continuous && moe_stream_decision);
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        ctx->moe_stream_cache.continuous_capture_layer =
+                moe_stream_continuous && moe_stream_decision ?
+                ggml_get_op_params_i32(cgraph->nodes[i], 0) : -1;
+
+        bool enqueued = ggml_vk_build_graph(
+                ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx,
+                i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit,
+                moe_stream_guarded);
+        ctx->moe_stream_cache.continuous_capture_layer = -1;
+
+        if (moe_stream_continuous && moe_stream_decision) {
+            moe_stream_guarded = true;
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -17510,6 +17740,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return op->ne[0] <= (1 << device->max_workgroup_size_log2);
                 }
             }
+        case GGML_OP_MOE_STREAM_CACHE_DECIDE:
+            return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op) && ggml_are_same_shape(op->src[0], op) &&
+                   ggml_get_op_params_i32(op, 0) >= 0 &&
+                   ggml_get_op_params_i32(op, 1) >= op->ne[0] &&
+                   ggml_get_op_params_i32(op, 2) >= op->ne[0];
         case GGML_OP_TOP_K:
             {
                 if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
@@ -17917,11 +18154,774 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static vk::DescriptorBufferInfo ggml_vk_moe_stream_buffer_info(const vk_buffer & buffer) {
+    GGML_ASSERT(buffer != nullptr);
+    return { buffer->buffer, 0, buffer->size };
+}
+
+static void ggml_vk_moe_stream_alloc(
+        vk_device & device,
+        vk_buffer & buffer,
+        size_t size,
+        vk::BufferUsageFlags extra_usage = {}) {
+    if (buffer != nullptr && buffer->size >= size) {
+        return;
+    }
+    ggml_vk_destroy_buffer(buffer);
+    buffer = ggml_vk_create_buffer_device(device, size, extra_usage);
+}
+
+static void ggml_vk_moe_stream_alloc_readback(vk_device & device, vk_buffer & buffer, size_t size) {
+    if (buffer != nullptr && buffer->size >= size) {
+        return;
+    }
+    ggml_vk_destroy_buffer(buffer);
+    buffer = ggml_vk_create_buffer_check(
+            device,
+            size,
+            vk::MemoryPropertyFlagBits::eHostVisible |
+                    vk::MemoryPropertyFlagBits::eHostCoherent |
+                    vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible |
+                    vk::MemoryPropertyFlagBits::eHostCoherent);
+}
+
+static void ggml_vk_moe_stream_copy_meta(
+        vk_context & compute_ctx, const vk_moe_stream_cache_state & cache) {
+    GGML_ASSERT(cache.plan_meta != nullptr);
+    GGML_ASSERT(cache.plan_meta_readback != nullptr);
+
+    compute_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eTransfer,
+            {},
+            { { vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eTransferRead } },
+            {}, {});
+    compute_ctx->s->buffer->buf.copyBuffer(
+            cache.plan_meta->buffer,
+            cache.plan_meta_readback->buffer,
+            { { 0, 0, VK_MOE_STREAM_META_COUNT * sizeof(int32_t) } });
+    compute_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost,
+            {},
+            { { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
+                vk::AccessFlagBits::eHostRead } },
+            {}, {});
+}
+
+static bool ggml_backend_vk_sync_moe_stream_cache(
+        ggml_backend_t backend,
+        const ggml_backend_moe_stream_cache_state * state) {
+    if (!ggml_backend_is_vk(backend) || state == nullptr || state->layer < 0 ||
+            state->n_expert == 0 || state->n_slots == 0 || state->n_slots > state->n_expert ||
+            state->expert_map == nullptr || state->available_map == nullptr ||
+            state->slot_expert == nullptr || state->slot_state == nullptr ||
+            state->route_hotness == nullptr || state->slot_last_use == nullptr) {
+        GGML_LOG_ERROR("%s: invalid Stream MoE shadow state\n", __func__);
+        return false;
+    }
+
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.plan_pending) {
+        GGML_LOG_ERROR("%s: a Stream MoE plan is still pending\n", __func__);
+        return false;
+    }
+
+    if (cache.layers.size() <= (size_t) state->layer) {
+        cache.layers.resize((size_t) state->layer + 1);
+    }
+    auto & layer = cache.layers[state->layer];
+    if ((layer.n_expert != 0 && layer.n_expert != state->n_expert) ||
+            (layer.n_slots != 0 && layer.n_slots != state->n_slots)) {
+        GGML_LOG_ERROR("%s: Stream MoE layer dimensions changed\n", __func__);
+        return false;
+    }
+
+    layer.n_expert = state->n_expert;
+    layer.n_slots = state->n_slots;
+    ggml_vk_moe_stream_alloc(ctx->device, layer.expert_map, state->n_expert * sizeof(int32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, layer.available_map, state->n_expert * sizeof(int32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, layer.slot_expert, state->n_slots * sizeof(int32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, layer.slot_state, state->n_slots * sizeof(uint32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, layer.route_hotness, state->n_expert * sizeof(uint32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, layer.slot_last_use, 2 * state->n_slots * sizeof(uint32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, layer.use_counter, 2 * sizeof(uint32_t));
+
+    cache.n_expert_capacity = std::max(cache.n_expert_capacity, state->n_expert);
+    cache.n_selected_capacity = std::max(cache.n_selected_capacity, state->n_expert);
+    ggml_vk_moe_stream_alloc(ctx->device, cache.selected, cache.n_selected_capacity * sizeof(int32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, cache.next_map, cache.n_expert_capacity * sizeof(int32_t));
+    ggml_vk_moe_stream_alloc_readback(ctx->device, cache.plan_loads,
+            4 * cache.n_expert_capacity * sizeof(int32_t));
+    ggml_vk_moe_stream_alloc(ctx->device, cache.mapped_topk, cache.n_selected_capacity * sizeof(int32_t));
+    const vk::BufferUsageFlags predicate_usage = ctx->device->conditional_rendering ?
+            vk::BufferUsageFlagBits::eConditionalRenderingEXT : vk::BufferUsageFlags {};
+    ggml_vk_moe_stream_alloc(
+            ctx->device, cache.plan_meta, VK_MOE_STREAM_META_BUFFER_SIZE, predicate_usage);
+    ggml_vk_moe_stream_alloc_readback(
+            ctx->device, cache.plan_meta_readback, VK_MOE_STREAM_META_COUNT * sizeof(int32_t));
+
+    cache.host_slot_state.resize(state->n_slots);
+    cache.host_slot_last_use.resize(2 * state->n_slots);
+    for (uint32_t slot = 0; slot < state->n_slots; ++slot) {
+        cache.host_slot_state[slot] = state->slot_state[slot];
+        const uint64_t stamp = (uint64_t) state->slot_last_use[slot];
+        cache.host_slot_last_use[2 * slot + 0] = (uint32_t) stamp;
+        cache.host_slot_last_use[2 * slot + 1] = (uint32_t) (stamp >> 32);
+    }
+
+    ggml_vk_buffer_write(layer.expert_map, 0, state->expert_map, state->n_expert * sizeof(int32_t));
+    ggml_vk_buffer_write(layer.available_map, 0, state->available_map, state->n_expert * sizeof(int32_t));
+    ggml_vk_buffer_write(layer.slot_expert, 0, state->slot_expert, state->n_slots * sizeof(int32_t));
+    ggml_vk_buffer_write(layer.slot_state, 0, cache.host_slot_state.data(), state->n_slots * sizeof(uint32_t));
+    ggml_vk_buffer_write(layer.route_hotness, 0, state->route_hotness, state->n_expert * sizeof(uint32_t));
+    ggml_vk_buffer_write(layer.slot_last_use, 0, cache.host_slot_last_use.data(), 2 * state->n_slots * sizeof(uint32_t));
+
+    const uint32_t use_counter[2] = {
+        (uint32_t) state->use_counter,
+        (uint32_t) (state->use_counter >> 32),
+    };
+    ggml_vk_buffer_write(layer.use_counter, 0, use_counter, sizeof(use_counter));
+
+    cache.synced_layer = state->layer;
+    cache.n_calls = state->n_calls;
+    cache.hot_decay_interval = state->hot_decay_interval;
+    return true;
+}
+
+static bool ggml_backend_vk_read_moe_stream_cache_policy(
+        ggml_backend_t backend,
+        int layer_id,
+        uint32_t * route_hotness,
+        size_t n_expert,
+        int64_t * slot_last_use,
+        size_t n_slots,
+        uint64_t * use_counter) {
+    if (!ggml_backend_is_vk(backend) || layer_id < 0 || route_hotness == nullptr ||
+            slot_last_use == nullptr || use_counter == nullptr) {
+        GGML_LOG_ERROR("%s: invalid Stream MoE policy read request\n", __func__);
+        return false;
+    }
+
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.plan_pending || (size_t) layer_id >= cache.layers.size()) {
+        GGML_LOG_ERROR("%s: Stream MoE state is unavailable\n", __func__);
+        return false;
+    }
+
+    auto & layer = cache.layers[layer_id];
+    if (layer.n_expert != n_expert || layer.n_slots != n_slots) {
+        GGML_LOG_ERROR("%s: Stream MoE layer dimensions changed\n", __func__);
+        return false;
+    }
+
+    cache.host_slot_last_use.resize(2 * n_slots);
+    ggml_vk_buffer_read(layer.route_hotness, 0, route_hotness, n_expert * sizeof(route_hotness[0]));
+    ggml_vk_buffer_read(layer.slot_last_use, 0, cache.host_slot_last_use.data(),
+            cache.host_slot_last_use.size() * sizeof(cache.host_slot_last_use[0]));
+    for (size_t slot = 0; slot < n_slots; ++slot) {
+        slot_last_use[slot] = (int64_t) ((uint64_t) cache.host_slot_last_use[2 * slot + 0] |
+                ((uint64_t) cache.host_slot_last_use[2 * slot + 1] << 32));
+    }
+
+    uint32_t counter[2] = {};
+    ggml_vk_buffer_read(layer.use_counter, 0, counter, sizeof(counter));
+    *use_counter = (uint64_t) counter[0] | ((uint64_t) counter[1] << 32);
+    return true;
+}
+
+static bool ggml_vk_moe_stream_dispatch(
+        ggml_backend_vk_context * ctx,
+        vk_moe_stream_cache_layer_state & layer,
+        int32_t layer_id,
+        uint32_t n_selected,
+        uint32_t mode,
+        uint32_t decay = 0,
+        bool synchronize = true,
+        vk::QueryPool timing_query_pool = nullptr) {
+    auto & cache = ctx->moe_stream_cache;
+    vk_pipeline pipeline = ctx->device->pipeline_moe_stream_cache_plan;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_moe_stream_cache_push_constants pc = {
+        layer.n_expert,
+        layer.n_slots,
+        n_selected,
+        mode,
+        decay,
+        layer_id,
+    };
+
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    if (timing_query_pool) {
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands, timing_query_pool, 0);
+    }
+    ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, {
+        ggml_vk_moe_stream_buffer_info(cache.selected),
+        ggml_vk_moe_stream_buffer_info(layer.expert_map),
+        ggml_vk_moe_stream_buffer_info(layer.available_map),
+        ggml_vk_moe_stream_buffer_info(layer.slot_expert),
+        ggml_vk_moe_stream_buffer_info(layer.slot_state),
+        ggml_vk_moe_stream_buffer_info(layer.route_hotness),
+        ggml_vk_moe_stream_buffer_info(layer.slot_last_use),
+        ggml_vk_moe_stream_buffer_info(cache.next_map),
+        ggml_vk_moe_stream_buffer_info(cache.plan_loads),
+        ggml_vk_moe_stream_buffer_info(cache.mapped_topk),
+        ggml_vk_moe_stream_buffer_info(cache.plan_meta),
+        ggml_vk_moe_stream_buffer_info(layer.use_counter),
+    }, pc, { 1, 1, 1 });
+    if (mode == 0) {
+        ggml_vk_moe_stream_copy_meta(compute_ctx, cache);
+    } else if (!synchronize) {
+        compute_ctx->s->buffer->buf.pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader,
+                vk::PipelineStageFlagBits::eComputeShader,
+                {},
+                { { vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite } },
+                {}, {});
+    }
+    if (timing_query_pool) {
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands, timing_query_pool, 1);
+    }
+    if (synchronize) {
+        ggml_vk_synchronize(ctx);
+    }
+    return true;
+}
+
+static bool ggml_vk_moe_stream_cache_decide(
+        ggml_backend_vk_context * ctx,
+        vk_context & compute_ctx,
+        const ggml_tensor * selected,
+        ggml_tensor * mapped_topk) {
+    if (selected == nullptr || mapped_topk == nullptr || selected->type != GGML_TYPE_I32 ||
+            mapped_topk->type != GGML_TYPE_I32 || !ggml_is_contiguous(selected) ||
+            !ggml_are_same_shape(selected, mapped_topk)) {
+        GGML_LOG_ERROR("%s: invalid Stream MoE graph planner tensors\n", __func__);
+        return false;
+    }
+
+    auto & cache = ctx->moe_stream_cache;
+    const int32_t layer_id = ggml_get_op_params_i32(mapped_topk, 0);
+    if (layer_id < 0 || (size_t) layer_id >= cache.layers.size()) {
+        GGML_LOG_ERROR("%s: Stream MoE layer %d was not initialized\n", __func__, layer_id);
+        return false;
+    }
+    auto & layer = cache.layers[layer_id];
+    const size_t n_selected_size = (size_t) ggml_nelements(selected);
+    if (layer.n_expert == 0 || n_selected_size == 0 || n_selected_size > layer.n_expert ||
+            n_selected_size > cache.n_selected_capacity || cache.plan_pending) {
+        GGML_LOG_ERROR("%s: invalid Stream MoE graph planner state for layer %d\n", __func__, layer_id);
+        return false;
+    }
+
+    ++cache.n_calls;
+    if (cache.continuous_recording) {
+        cache.continuous_planner_calls.emplace_back(layer_id, cache.n_calls);
+    }
+    const bool decay = cache.hot_decay_interval > 0 &&
+            cache.n_calls % cache.hot_decay_interval == 0;
+    if (!cache.continuous_recording) {
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 1);
+    }
+    if (decay) {
+        for (size_t i = 0; i < cache.layers.size(); ++i) {
+            auto & other = cache.layers[i];
+            if ((int32_t) i == layer_id || other.n_expert == 0) {
+                continue;
+            }
+            const vk_moe_stream_cache_push_constants pc = {
+                other.n_expert,
+                other.n_slots,
+                0,
+                2,
+                0,
+                (int32_t) i,
+            };
+            vk_pipeline pipeline = ctx->device->pipeline_moe_stream_cache_plan;
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, {
+                ggml_vk_tensor_subbuffer(ctx, selected),
+                ggml_vk_moe_stream_buffer_info(other.expert_map),
+                ggml_vk_moe_stream_buffer_info(other.available_map),
+                ggml_vk_moe_stream_buffer_info(other.slot_expert),
+                ggml_vk_moe_stream_buffer_info(other.slot_state),
+                ggml_vk_moe_stream_buffer_info(other.route_hotness),
+                ggml_vk_moe_stream_buffer_info(other.slot_last_use),
+                ggml_vk_moe_stream_buffer_info(cache.next_map),
+                ggml_vk_moe_stream_buffer_info(cache.plan_loads),
+                ggml_vk_tensor_subbuffer(ctx, mapped_topk),
+                ggml_vk_moe_stream_buffer_info(cache.plan_meta),
+                ggml_vk_moe_stream_buffer_info(other.use_counter),
+            }, pc, { 1, 1, 1 });
+        }
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_moe_stream_cache_plan;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_moe_stream_cache_push_constants pc = {
+        layer.n_expert,
+        layer.n_slots,
+        (uint32_t) n_selected_size,
+        3,
+        decay ? 1u : 0u,
+        layer_id,
+    };
+    ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, selected),
+        ggml_vk_moe_stream_buffer_info(layer.expert_map),
+        ggml_vk_moe_stream_buffer_info(layer.available_map),
+        ggml_vk_moe_stream_buffer_info(layer.slot_expert),
+        ggml_vk_moe_stream_buffer_info(layer.slot_state),
+        ggml_vk_moe_stream_buffer_info(layer.route_hotness),
+        ggml_vk_moe_stream_buffer_info(layer.slot_last_use),
+        ggml_vk_moe_stream_buffer_info(cache.next_map),
+        ggml_vk_moe_stream_buffer_info(cache.plan_loads),
+        ggml_vk_tensor_subbuffer(ctx, mapped_topk),
+        ggml_vk_moe_stream_buffer_info(cache.plan_meta),
+        ggml_vk_moe_stream_buffer_info(layer.use_counter),
+    }, pc, { 1, 1, 1 });
+    ggml_vk_moe_stream_copy_meta(compute_ctx, cache);
+    if (!cache.continuous_recording) {
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 2);
+    }
+    return true;
+}
+
+static bool ggml_backend_vk_prepare_moe_stream_cache(
+        ggml_backend_t backend,
+        const ggml_tensor * decision,
+        ggml_backend_moe_stream_cache_plan * plan) {
+    if (!ggml_backend_is_vk(backend) || decision == nullptr || plan == nullptr ||
+            decision->type != GGML_TYPE_I32 || !ggml_is_contiguous(decision) ||
+            ggml_nelements(decision) <= 0) {
+        GGML_LOG_ERROR("%s: invalid Stream MoE prepare request\n", __func__);
+        return false;
+    }
+
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    const bool graph_prepared = decision->op == GGML_OP_MOE_STREAM_CACHE_DECIDE;
+    const int32_t layer_id = graph_prepared ? ggml_get_op_params_i32(decision, 0) : cache.synced_layer;
+    const bool continuous_plan = graph_prepared && cache.pending_continuous_plan &&
+            cache.continuous_miss_layer == layer_id;
+    const ggml_tensor * selected = graph_prepared ? decision->src[0] : decision;
+    if (cache.plan_pending || layer_id < 0 || (size_t) layer_id >= cache.layers.size() ||
+            selected == nullptr || selected->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(selected)) {
+        GGML_LOG_ERROR("%s: Stream MoE state was not synchronized\n", __func__);
+        return false;
+    }
+
+    const size_t n_selected_size = (size_t) ggml_nelements(selected);
+    if (n_selected_size > UINT32_MAX) {
+        GGML_LOG_ERROR("%s: too many selected experts\n", __func__);
+        return false;
+    }
+    const uint32_t n_selected = (uint32_t) n_selected_size;
+    auto & layer = cache.layers[layer_id];
+
+    if (!graph_prepared) {
+        if (decision->data == nullptr) {
+            GGML_LOG_ERROR("%s: Stream MoE shadow input is not host accessible\n", __func__);
+            return false;
+        }
+        cache.n_expert_capacity = std::max(cache.n_expert_capacity, layer.n_expert);
+        cache.n_selected_capacity = std::max(cache.n_selected_capacity, n_selected);
+        ggml_vk_moe_stream_alloc(ctx->device, cache.selected, cache.n_selected_capacity * sizeof(int32_t));
+        ggml_vk_moe_stream_alloc(ctx->device, cache.next_map, cache.n_expert_capacity * sizeof(int32_t));
+        ggml_vk_moe_stream_alloc_readback(ctx->device, cache.plan_loads,
+                4 * cache.n_expert_capacity * sizeof(int32_t));
+        ggml_vk_moe_stream_alloc(ctx->device, cache.mapped_topk, cache.n_selected_capacity * sizeof(int32_t));
+        const vk::BufferUsageFlags predicate_usage = ctx->device->conditional_rendering ?
+                vk::BufferUsageFlagBits::eConditionalRenderingEXT : vk::BufferUsageFlags {};
+        ggml_vk_moe_stream_alloc(
+                ctx->device, cache.plan_meta, VK_MOE_STREAM_META_BUFFER_SIZE, predicate_usage);
+        ggml_vk_moe_stream_alloc_readback(
+                ctx->device, cache.plan_meta_readback, VK_MOE_STREAM_META_COUNT * sizeof(int32_t));
+
+        ggml_vk_buffer_write(cache.selected, 0, decision->data, n_selected * sizeof(int32_t));
+        ggml_vk_moe_stream_dispatch(ctx, layer, layer_id, n_selected, 0);
+    }
+
+    int32_t meta[VK_MOE_STREAM_META_COUNT] = {};
+    GGML_ASSERT(cache.plan_meta_readback != nullptr && cache.plan_meta_readback->ptr != nullptr);
+    memcpy(meta, cache.plan_meta_readback->ptr, sizeof(meta));
+    plan->t_gpu_segment_ns = 0;
+    plan->t_gpu_planner_ns = 0;
+    plan->t_gpu_commit_carry_ns = 0;
+    plan->n_gpu_commit_carry = 0;
+    if (graph_prepared && cache.commit_timing_pending) {
+        uint64_t timestamps[2] = {};
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->moe_stream_commit_query_pool,
+                0,
+                2,
+                sizeof(timestamps),
+                timestamps,
+                sizeof(timestamps[0]),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "get Stream MoE commit timestamp results");
+        plan->t_gpu_commit_carry_ns = (uint64_t) ((timestamps[1] - timestamps[0]) *
+                ctx->device->properties.limits.timestampPeriod);
+        plan->n_gpu_commit_carry = 1;
+        cache.commit_timing_pending = false;
+    }
+    if (graph_prepared && !continuous_plan) {
+        uint64_t timestamps[3] = {};
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->moe_stream_query_pool,
+                0,
+                3,
+                sizeof(timestamps),
+                timestamps,
+                sizeof(timestamps[0]),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "get Stream MoE planner timestamp results");
+        plan->t_gpu_segment_ns = (uint64_t) ((timestamps[2] - timestamps[0]) *
+                ctx->device->properties.limits.timestampPeriod);
+        plan->t_gpu_planner_ns = (uint64_t) ((timestamps[2] - timestamps[1]) *
+                ctx->device->properties.limits.timestampPeriod);
+    }
+    if (meta[0] != 0 || meta[1] < 0 || meta[1] > (int32_t) layer.n_expert ||
+            meta[2] < 0 || meta[2] > (int32_t) layer.n_expert ||
+            meta[4] < 0 || meta[4] > (int32_t) layer.n_expert ||
+            meta[5] != (int32_t) n_selected) {
+        const char * reason = meta[0] == 1 ? "invalid selected expert" :
+                meta[0] == 2 ? "selected experts exceed cache capacity" :
+                meta[0] == 3 ? "no cache victim is available" :
+                meta[0] == 4 ? "invalid victim mapping" :
+                meta[0] == 5 ? "selected expert is not mapped" : "invalid plan metadata";
+        GGML_LOG_ERROR("%s: GPU planner failed for layer=%d: %s (status=%d detail=%d required=%d)\n",
+                __func__, layer_id, reason, meta[0], meta[3], meta[2]);
+        return false;
+    }
+
+    static_assert(sizeof(ggml_backend_moe_stream_cache_load) == 3 * sizeof(int32_t),
+            "Stream MoE cache load must be tightly packed");
+    const bool slow_path = meta[1] > 0 || meta[4] > 0;
+    cache.host_loads.resize(meta[1]);
+    cache.host_required_slots.resize(slow_path ? meta[2] : 0);
+    cache.host_mapped_topk.resize(!graph_prepared ? n_selected : 0);
+    cache.host_next_map.resize(!graph_prepared && slow_path ? layer.n_expert : 0);
+    if (!cache.host_loads.empty()) {
+        GGML_ASSERT(cache.plan_loads != nullptr && cache.plan_loads->ptr != nullptr);
+        memcpy(cache.host_loads.data(), cache.plan_loads->ptr,
+                cache.host_loads.size() * sizeof(cache.host_loads[0]));
+    }
+    if (!cache.host_required_slots.empty()) {
+        GGML_ASSERT(cache.plan_loads != nullptr && cache.plan_loads->ptr != nullptr);
+        memcpy(cache.host_required_slots.data(),
+                (const int32_t *) cache.plan_loads->ptr + 3 * layer.n_expert,
+                cache.host_required_slots.size() * sizeof(cache.host_required_slots[0]));
+    }
+    if (!cache.host_next_map.empty()) {
+        ggml_vk_buffer_read(cache.next_map, 0, cache.host_next_map.data(),
+                cache.host_next_map.size() * sizeof(cache.host_next_map[0]));
+    }
+    if (!cache.host_mapped_topk.empty()) {
+        if (graph_prepared) {
+            vk_subbuffer mapped = ggml_vk_tensor_subbuffer(ctx, decision);
+            ggml_vk_buffer_read(mapped.buffer, mapped.offset, cache.host_mapped_topk.data(),
+                    cache.host_mapped_topk.size() * sizeof(cache.host_mapped_topk[0]));
+        } else {
+            ggml_vk_buffer_read(cache.mapped_topk, 0, cache.host_mapped_topk.data(),
+                    cache.host_mapped_topk.size() * sizeof(cache.host_mapped_topk[0]));
+        }
+    }
+
+    cache.pending_layer = layer_id;
+    cache.plan_pending = true;
+    cache.pending_graph_plan = graph_prepared;
+    cache.pending_slow_path = slow_path;
+    plan->loads = cache.host_loads.data();
+    plan->n_loads = cache.host_loads.size();
+    plan->n_required = (size_t) meta[2];
+    plan->n_waiting = (size_t) meta[4];
+    plan->required_slots = cache.host_required_slots.data();
+    plan->n_required_slots = cache.host_required_slots.size();
+    plan->mapped_topk = cache.host_mapped_topk.data();
+    plan->n_mapped_topk = cache.host_mapped_topk.size();
+    plan->next_map = cache.host_next_map.data();
+    plan->n_next_map = cache.host_next_map.size();
+    return true;
+}
+
+static bool ggml_backend_vk_commit_moe_stream_cache(ggml_backend_t backend, int layer_id) {
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (!cache.plan_pending || cache.pending_layer != layer_id) {
+        GGML_LOG_ERROR("%s: invalid Stream MoE commit request\n", __func__);
+        return false;
+    }
+
+    bool committed = true;
+    if (cache.pending_slow_path) {
+        auto & layer = cache.layers[layer_id];
+        vk::QueryPool timing_query_pool = nullptr;
+        if (cache.pending_graph_plan) {
+            GGML_ASSERT(!cache.commit_timing_pending);
+            if (!ctx->moe_stream_commit_query_pool) {
+                vk::QueryPoolCreateInfo query_create_info;
+                query_create_info.queryType = vk::QueryType::eTimestamp;
+                query_create_info.queryCount = 2;
+                ctx->moe_stream_commit_query_pool = ctx->device->device.createQueryPool(query_create_info);
+            }
+            ctx->device->device.resetQueryPool(ctx->moe_stream_commit_query_pool, 0, 2);
+            timing_query_pool = ctx->moe_stream_commit_query_pool;
+        }
+        ggml_vk_moe_stream_dispatch(
+                ctx, layer, layer_id, 0, 1, 0, !cache.pending_graph_plan, timing_query_pool);
+        cache.commit_timing_pending = cache.pending_graph_plan;
+
+        if (!cache.pending_graph_plan) {
+            std::vector<int32_t> expert_map(layer.n_expert);
+            ggml_vk_buffer_read(layer.expert_map, 0, expert_map.data(), expert_map.size() * sizeof(expert_map[0]));
+            committed = expert_map == cache.host_next_map;
+            if (!committed) {
+                GGML_LOG_ERROR("%s: Stream MoE expert_map does not match next_map\n", __func__);
+            }
+        }
+    }
+    cache.pending_layer = -1;
+    cache.plan_pending = false;
+    cache.pending_graph_plan = false;
+    cache.pending_slow_path = false;
+    cache.pending_continuous_plan = false;
+    cache.continuous_miss_layer = -1;
+    return committed;
+}
+
+static void ggml_backend_vk_abort_moe_stream_cache(ggml_backend_t backend, int layer_id) {
+    if (!ggml_backend_is_vk(backend)) {
+        return;
+    }
+    auto & cache = ((ggml_backend_vk_context *) backend->context)->moe_stream_cache;
+    if (cache.plan_pending && cache.pending_layer == layer_id) {
+        cache.pending_layer = -1;
+        cache.plan_pending = false;
+        cache.pending_graph_plan = false;
+        cache.pending_slow_path = false;
+    }
+    if (cache.pending_continuous_plan && cache.continuous_miss_layer == layer_id) {
+        cache.pending_continuous_plan = false;
+        cache.continuous_miss_layer = -1;
+    }
+}
+
+static bool ggml_backend_vk_moe_stream_supports_continuous(ggml_backend_t backend) {
+    return ggml_backend_is_vk(backend) &&
+            ((ggml_backend_vk_context *) backend->context)->device->conditional_rendering;
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_begin(ggml_backend_t backend, bool resume) {
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (resume || !ctx->device->conditional_rendering || cache.plan_meta == nullptr ||
+            cache.plan_meta_readback == nullptr || cache.plan_pending ||
+            cache.pending_continuous_plan || cache.continuous_active) {
+        return false;
+    }
+    cache.continuous_active = true;
+    cache.continuous_recording = true;
+    cache.continuous_capture_layer = -1;
+    cache.continuous_resume_plan = 0;
+    cache.continuous_planner_calls.clear();
+    cache.continuous_commands.clear();
+    return true;
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_wait(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx->moe_stream_cache.continuous_active) {
+        return false;
+    }
+    ggml_vk_synchronize(ctx);
+    ctx->moe_stream_cache.continuous_recording = false;
+    return true;
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_resume(ggml_backend_t backend, int32_t layer_id) {
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (!cache.continuous_active || cache.continuous_recording || cache.plan_pending ||
+            cache.pending_continuous_plan) {
+        return false;
+    }
+
+    size_t plan_index = cache.continuous_planner_calls.size();
+    for (size_t i = 0; i < cache.continuous_planner_calls.size(); ++i) {
+        if (cache.continuous_planner_calls[i].first == layer_id) {
+            plan_index = i;
+            break;
+        }
+    }
+    size_t command_index = cache.continuous_commands.size();
+    for (size_t i = 0; i < cache.continuous_commands.size(); ++i) {
+        if (cache.continuous_commands[i].second == layer_id) {
+            command_index = i;
+            break;
+        }
+    }
+    if (plan_index == cache.continuous_planner_calls.size() ||
+            command_index == cache.continuous_commands.size()) {
+        return false;
+    }
+    cache.continuous_resume_plan = plan_index + 1;
+
+    if (ggml_vk_submit_transfer_ctx(ctx)) {
+        ctx->submit_pending = true;
+    }
+    if (!ctx->compute_ctx.expired()) {
+        vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        ggml_vk_ctx_end(compute_ctx);
+        for (auto & cpy : compute_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        ggml_vk_submit(compute_ctx, {});
+        ctx->compute_ctx.reset();
+        ctx->submit_pending = true;
+    }
+
+    std::vector<vk::CommandBuffer> command_buffers;
+    command_buffers.reserve(cache.continuous_commands.size() - command_index - 1);
+    for (size_t i = command_index + 1; i < cache.continuous_commands.size(); ++i) {
+        command_buffers.push_back(cache.continuous_commands[i].first->buf);
+    }
+    if (!command_buffers.empty()) {
+        vk::SubmitInfo submit_info;
+        submit_info.commandBufferCount = (uint32_t) command_buffers.size();
+        submit_info.pCommandBuffers = command_buffers.data();
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({ submit_info }, {});
+        ctx->submit_pending = true;
+    }
+    return true;
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_status(
+        ggml_backend_t backend,
+        int32_t * miss_layer,
+        size_t * n_hit_plans) {
+    if (!ggml_backend_is_vk(backend) || miss_layer == nullptr || n_hit_plans == nullptr) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (!cache.continuous_active || cache.continuous_recording) {
+        return false;
+    }
+
+    *miss_layer = -1;
+    *n_hit_plans = 0;
+    if (cache.continuous_resume_plan >= cache.continuous_planner_calls.size()) {
+        return true;
+    }
+
+    int32_t meta[VK_MOE_STREAM_META_COUNT] = {};
+    GGML_ASSERT(cache.plan_meta_readback != nullptr && cache.plan_meta_readback->ptr != nullptr);
+    memcpy(meta, cache.plan_meta_readback->ptr, sizeof(meta));
+    const int32_t layer_id = meta[7];
+
+    size_t plan_index = cache.continuous_planner_calls.size();
+    for (size_t i = cache.continuous_resume_plan; i < cache.continuous_planner_calls.size(); ++i) {
+        if (cache.continuous_planner_calls[i].first == layer_id) {
+            plan_index = i;
+            break;
+        }
+    }
+    if (plan_index == cache.continuous_planner_calls.size()) {
+        return false;
+    }
+
+    if (meta[6] != 0) {
+        if (plan_index + 1 != cache.continuous_planner_calls.size()) {
+            return false;
+        }
+        *n_hit_plans = cache.continuous_planner_calls.size() - cache.continuous_resume_plan;
+        cache.n_calls = cache.continuous_planner_calls.back().second;
+        cache.continuous_resume_plan = cache.continuous_planner_calls.size();
+    } else {
+        cache.n_calls = cache.continuous_planner_calls[plan_index].second;
+        *miss_layer = layer_id;
+        *n_hit_plans = plan_index - cache.continuous_resume_plan;
+        cache.pending_continuous_plan = true;
+        cache.continuous_miss_layer = layer_id;
+    }
+    return true;
+}
+
+static void ggml_backend_vk_moe_stream_continuous_end(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (!cache.continuous_active) {
+        return;
+    }
+    ggml_vk_synchronize(ctx);
+    cache.continuous_active = false;
+    cache.continuous_recording = false;
+    cache.pending_continuous_plan = false;
+    cache.continuous_miss_layer = -1;
+    cache.continuous_capture_layer = -1;
+    cache.continuous_resume_plan = 0;
+    cache.continuous_planner_calls.clear();
+    cache.continuous_commands.clear();
+    ggml_vk_graph_cleanup(ctx);
+}
+
+static const ggml_backend_moe_stream_cache_ops * ggml_backend_vk_get_moe_stream_cache_ops() {
+    static const ggml_backend_moe_stream_cache_ops ops = {
+        /* .sync        = */ ggml_backend_vk_sync_moe_stream_cache,
+        /* .read_policy = */ ggml_backend_vk_read_moe_stream_cache_policy,
+        /* .prepare     = */ ggml_backend_vk_prepare_moe_stream_cache,
+        /* .commit      = */ ggml_backend_vk_commit_moe_stream_cache,
+        /* .abort       = */ ggml_backend_vk_abort_moe_stream_cache,
+        /* .supports_continuous = */ ggml_backend_vk_moe_stream_supports_continuous,
+        /* .continuous_begin  = */ ggml_backend_vk_moe_stream_continuous_begin,
+        /* .continuous_wait   = */ ggml_backend_vk_moe_stream_continuous_wait,
+        /* .continuous_resume = */ ggml_backend_vk_moe_stream_continuous_resume,
+        /* .continuous_status = */ ggml_backend_vk_moe_stream_continuous_status,
+        /* .continuous_end    = */ ggml_backend_vk_moe_stream_continuous_end,
+    };
+    return &ops;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    UNUSED(reg);
+    if (strcmp(name, "ggml_backend_get_moe_stream_cache_ops") == 0) {
+        return (void *) ggml_backend_vk_get_moe_stream_cache_ops;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

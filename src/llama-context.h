@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -139,7 +140,8 @@ struct llama_context {
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                        ggml_status & ret,
-                              bool   moe_stats_prefill);
+                              bool   moe_stats_prefill,
+                              bool   moe_gpu_decode);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -262,7 +264,11 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                  bool     moe_stream_gpu_decode = false) const;
+
+    static bool eval_callback_trampoline(ggml_tensor * tensor, bool ask, void * user_data);
+    bool eval_callback(ggml_tensor * tensor, bool ask);
 
     llm_graph_cb graph_get_cb() const;
 
@@ -393,9 +399,40 @@ private:
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
     struct {
-        int64_t n_hit  = 0;
-        int64_t n_miss = 0;
+        int64_t n_hit               = 0;
+        int64_t n_miss              = 0;
+        int64_t n_shadow_plans      = 0;
+        int64_t n_shadow_mismatches = 0;
+        int64_t n_gpu_hit_plans      = 0;
+        int64_t t_gpu_hit_segment_ns = 0;
+        int64_t t_gpu_hit_planner_ns = 0;
+        int64_t t_gpu_hit_wall_us    = 0;
+        int64_t t_gpu_hit_sync_us    = 0;
+        int64_t t_gpu_hit_cb_us      = 0;
+        int64_t t_gpu_hit_prepare_us = 0;
+        int64_t t_gpu_hit_commit_us  = 0;
+        int64_t n_gpu_slow_plans      = 0;
+        int64_t n_gpu_slow_loads      = 0;
+        int64_t t_gpu_slow_segment_ns = 0;
+        int64_t t_gpu_slow_planner_ns = 0;
+        int64_t t_gpu_slow_wall_us    = 0;
+        int64_t t_gpu_slow_sync_us    = 0;
+        int64_t t_gpu_slow_cb_us      = 0;
+        int64_t t_gpu_slow_prepare_us = 0;
+        int64_t t_gpu_slow_load_us    = 0;
+        int64_t t_gpu_slow_commit_us  = 0;
+        int64_t n_gpu_slow_waiting     = 0;
+        int64_t t_gpu_slow_resident_wait_us = 0;
+        int64_t n_gpu_commit_carry     = 0;
+        int64_t t_gpu_commit_carry_ns  = 0;
+        int64_t n_worker_loads         = 0;
+        int64_t t_worker_queue_us      = 0;
+        int64_t t_worker_read_us       = 0;
+        int64_t t_worker_upload_us     = 0;
     } moe_stats_prefill, moe_stats_decode;
 
     bool moe_stats_active = false;
+
+    std::unordered_set<ggml_tensor *> eval_callback_user_requested;
+    bool moe_stream_callback_failed = false;
 };

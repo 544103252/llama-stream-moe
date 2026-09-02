@@ -1076,9 +1076,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_STREAM_CACHE_DECIDE",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,9 +1189,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_stream_cache_decide(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6089,6 +6093,32 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+
+struct ggml_tensor * ggml_moe_stream_cache_decide(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * selected_experts,
+        int32_t               layer,
+        int32_t               n_expert,
+        int32_t               n_slots) {
+    GGML_ASSERT(selected_experts != NULL);
+    GGML_ASSERT(selected_experts->type == GGML_TYPE_I32);
+    GGML_ASSERT(selected_experts->ne[0] > 0);
+    GGML_ASSERT(selected_experts->ne[1] > 0);
+    GGML_ASSERT(selected_experts->ne[2] == 1);
+    GGML_ASSERT(selected_experts->ne[3] == 1);
+    GGML_ASSERT(layer >= 0);
+    GGML_ASSERT(n_expert >= selected_experts->ne[0]);
+    GGML_ASSERT(n_slots >= selected_experts->ne[0] && n_slots <= n_expert);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, selected_experts);
+    result->op = GGML_OP_MOE_STREAM_CACHE_DECIDE;
+    result->src[0] = selected_experts;
+    ggml_set_op_params_i32(result, 0, layer);
+    ggml_set_op_params_i32(result, 1, n_expert);
+    ggml_set_op_params_i32(result, 2, n_slots);
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(

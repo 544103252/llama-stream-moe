@@ -812,6 +812,10 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    int64_t callback_eval_sync_us;
+    int64_t callback_eval_segment_us;
+    bool moe_stream_continuous;
+    int64_t moe_stream_hit_plans;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1542,6 +1546,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    sched->moe_stream_hit_plans = 0;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1674,7 +1680,92 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        bool has_moe_stream_decision = false;
+        if (sched->moe_stream_continuous) {
+            for (int i = 0; i < split->graph.n_nodes; ++i) {
+                if (split->graph.nodes[i]->op == GGML_OP_MOE_STREAM_CACHE_DECIDE) {
+                    has_moe_stream_decision = true;
+                    break;
+                }
+            }
+        }
+
+        if (has_moe_stream_decision) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto get_ops = reg ? (ggml_backend_get_moe_stream_cache_ops_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_moe_stream_cache_ops") : nullptr;
+            const ggml_backend_moe_stream_cache_ops * ops = get_ops ? get_ops() : nullptr;
+            if (ops == nullptr || ops->continuous_begin == nullptr || ops->continuous_wait == nullptr ||
+                    ops->continuous_resume == nullptr || ops->continuous_status == nullptr ||
+                    ops->continuous_end == nullptr || sched->callback_eval == nullptr) {
+                GGML_LOG_ERROR("%s: backend does not support continuous Stream MoE execution\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+
+            if (!ops->continuous_begin(split_backend, false)) {
+                GGML_LOG_ERROR("%s: failed to begin continuous Stream MoE execution\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+            const auto end_continuous = [&] { ops->continuous_end(split_backend); };
+            int64_t segment_start_us = ggml_time_us();
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (ec != GGML_STATUS_SUCCESS) {
+                end_continuous();
+                return ec;
+            }
+
+            while (true) {
+                const int64_t sync_start_us = ggml_time_us();
+                if (!ops->continuous_wait(split_backend)) {
+                    GGML_LOG_ERROR("%s: failed to wait for continuous Stream MoE execution\n", __func__);
+                    end_continuous();
+                    return GGML_STATUS_FAILED;
+                }
+                sched->callback_eval_sync_us = ggml_time_us() - sync_start_us;
+                sched->callback_eval_segment_us = ggml_time_us() - segment_start_us;
+
+                int32_t miss_layer = -1;
+                size_t n_hit_plans = 0;
+                if (!ops->continuous_status(split_backend, &miss_layer, &n_hit_plans)) {
+                    GGML_LOG_ERROR("%s: failed to finish continuous Stream MoE execution\n", __func__);
+                    end_continuous();
+                    return GGML_STATUS_FAILED;
+                }
+                sched->moe_stream_hit_plans += (int64_t) n_hit_plans;
+                if (miss_layer < 0) {
+                    end_continuous();
+                    break;
+                }
+
+                int decision_idx = -1;
+                for (int i = 0; i < split->graph.n_nodes; ++i) {
+                    ggml_tensor * node = split->graph.nodes[i];
+                    if (node->op == GGML_OP_MOE_STREAM_CACHE_DECIDE &&
+                            ggml_get_op_params_i32(node, 0) == miss_layer) {
+                        decision_idx = i;
+                        break;
+                    }
+                }
+                if (decision_idx < 0) {
+                    GGML_LOG_ERROR("%s: missing Stream MoE decision node for layer %d\n", __func__, miss_layer);
+                    end_continuous();
+                    return GGML_STATUS_FAILED;
+                }
+                if (!sched->callback_eval(split->graph.nodes[decision_idx], false,
+                            sched->callback_eval_user_data)) {
+                    end_continuous();
+                    return GGML_STATUS_FAILED;
+                }
+                if (!ops->continuous_resume(split_backend, miss_layer)) {
+                    GGML_LOG_ERROR("%s: failed to resume continuous Stream MoE execution after layer %d\n",
+                            __func__, miss_layer);
+                    end_continuous();
+                    return GGML_STATUS_FAILED;
+                }
+                segment_start_us = ggml_time_us();
+            }
+        } else if (!sched->callback_eval || sched->moe_stream_continuous) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1697,13 +1788,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                const int64_t segment_start_us = ggml_time_us();
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                const int64_t sync_start_us = ggml_time_us();
                 ggml_backend_synchronize(split_backend);
+                sched->callback_eval_sync_us = ggml_time_us() - sync_start_us;
+                sched->callback_eval_segment_us = ggml_time_us() - segment_start_us;
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -1918,6 +2013,26 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_moe_stream_continuous(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->moe_stream_continuous = enabled;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_hit_plans(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_hit_plans;
+}
+
+int64_t ggml_backend_sched_get_last_eval_callback_sync_us(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->callback_eval_sync_us;
+}
+
+int64_t ggml_backend_sched_get_last_eval_callback_segment_us(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->callback_eval_segment_us;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

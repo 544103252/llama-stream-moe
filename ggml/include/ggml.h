@@ -584,6 +584,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_STREAM_CACHE_DECIDE,
+
         GGML_OP_COUNT,
     };
 
@@ -2653,6 +2655,14 @@ extern "C" {
             ggml_custom_op_t      fun,
             int                   n_tasks,
             void                * userdata);
+
+    // Build a Stream MoE cache plan and return mapped_topk.
+    GGML_API struct ggml_tensor * ggml_moe_stream_cache_decide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * selected_experts,
+            int32_t               layer,
+            int32_t               n_expert,
+            int32_t               n_slots);
 
     // loss function
 

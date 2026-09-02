@@ -31,6 +31,41 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+bool llama_context::eval_callback_trampoline(ggml_tensor * tensor, bool ask, void * user_data) {
+    llama_context * ctx = static_cast<llama_context *>(user_data);
+    return ctx != nullptr && ctx->eval_callback(tensor, ask);
+}
+
+bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
+    bool user_requested = false;
+    if (cparams.cb_eval != nullptr && ask) {
+        user_requested = cparams.cb_eval(tensor, true, cparams.cb_eval_user_data);
+        if (user_requested) {
+            eval_callback_user_requested.insert(tensor);
+        }
+    }
+
+    bool stream_requested = false;
+    bool stream_succeeded = true;
+    if (auto * mstream = model.moe_stream()) {
+        stream_succeeded = mstream->eval_callback(
+                sched.get(), tensor, ask, stream_requested);
+    }
+
+    if (ask) {
+        return user_requested || stream_requested;
+    }
+
+    if (!stream_succeeded) {
+        moe_stream_callback_failed = true;
+    }
+    bool keep_going = stream_succeeded;
+    if (eval_callback_user_requested.erase(tensor) > 0 && cparams.cb_eval != nullptr) {
+        keep_going = cparams.cb_eval(tensor, false, cparams.cb_eval_user_data) && keep_going;
+    }
+    return keep_going;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -380,6 +415,10 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        if (auto * mstream = model.moe_stream()) {
+            mstream->bind_decode_backends(backend_ptrs);
+        }
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
@@ -436,6 +475,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (auto * mstream = model.moe_stream()) {
+        mstream->unbind_decode_backends();
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1325,7 +1367,8 @@ llm_graph_result * llama_context::process_ubatch(
         llm_graph_type gtype,
         llama_memory_context_i * mctx,
         ggml_status & ret,
-        bool moe_stats_prefill) {
+        bool moe_stats_prefill,
+        bool moe_gpu_decode) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1337,7 +1380,16 @@ llm_graph_result * llama_context::process_ubatch(
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    bool gpu_decode_active = false;
+    if (moe_gpu_decode) {
+        if (auto * mstream = model.moe_stream()) {
+            gpu_decode_active = mstream->prepare_decode();
+        }
+    }
+    const bool moe_stream_continuous = gpu_decode_active && model.moe_stream() != nullptr &&
+            model.moe_stream()->gpu_decode_continuous && cparams.cb_eval == nullptr;
+    ggml_backend_sched_set_moe_stream_continuous(sched.get(), moe_stream_continuous);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, gpu_decode_active);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1354,7 +1406,11 @@ llm_graph_result * llama_context::process_ubatch(
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        const bool stream_callback = model.moe_stream() != nullptr && model.moe_stream()->gpu_decode;
+        ggml_backend_sched_set_eval_callback(
+                sched.get(),
+                (stream_callback || cparams.cb_eval != nullptr) ? eval_callback_trampoline : nullptr,
+                this);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1392,11 +1448,44 @@ llm_graph_result * llama_context::process_ubatch(
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
+    if (status == GGML_STATUS_SUCCESS && mstream && moe_stream_continuous) {
+        mstream->record_continuous_hits(
+                (size_t) ggml_backend_sched_get_last_moe_stream_hit_plans(sched.get()));
+    }
+
     if (mstream) {
         const auto stats = mstream->token_stats_end();
         auto & phase = moe_stats_prefill ? this->moe_stats_prefill : moe_stats_decode;
-        phase.n_hit  += stats.n_hit;
-        phase.n_miss += stats.n_miss;
+        phase.n_hit               += stats.n_hit;
+        phase.n_miss              += stats.n_miss;
+        phase.n_shadow_plans      += stats.n_shadow_plans;
+        phase.n_shadow_mismatches += stats.n_shadow_mismatches;
+        phase.n_gpu_hit_plans      += stats.n_gpu_hit_plans;
+        phase.t_gpu_hit_segment_ns += stats.t_gpu_hit_segment_ns;
+        phase.t_gpu_hit_planner_ns += stats.t_gpu_hit_planner_ns;
+        phase.t_gpu_hit_wall_us    += stats.t_gpu_hit_wall_us;
+        phase.t_gpu_hit_sync_us    += stats.t_gpu_hit_sync_us;
+        phase.t_gpu_hit_cb_us      += stats.t_gpu_hit_cb_us;
+        phase.t_gpu_hit_prepare_us += stats.t_gpu_hit_prepare_us;
+        phase.t_gpu_hit_commit_us  += stats.t_gpu_hit_commit_us;
+        phase.n_gpu_slow_plans      += stats.n_gpu_slow_plans;
+        phase.n_gpu_slow_loads      += stats.n_gpu_slow_loads;
+        phase.t_gpu_slow_segment_ns += stats.t_gpu_slow_segment_ns;
+        phase.t_gpu_slow_planner_ns += stats.t_gpu_slow_planner_ns;
+        phase.t_gpu_slow_wall_us    += stats.t_gpu_slow_wall_us;
+        phase.t_gpu_slow_sync_us    += stats.t_gpu_slow_sync_us;
+        phase.t_gpu_slow_cb_us      += stats.t_gpu_slow_cb_us;
+        phase.t_gpu_slow_prepare_us += stats.t_gpu_slow_prepare_us;
+        phase.t_gpu_slow_load_us    += stats.t_gpu_slow_load_us;
+        phase.t_gpu_slow_commit_us  += stats.t_gpu_slow_commit_us;
+        phase.n_gpu_slow_waiting     += stats.n_gpu_slow_waiting;
+        phase.t_gpu_slow_resident_wait_us += stats.t_gpu_slow_resident_wait_us;
+        phase.n_gpu_commit_carry     += stats.n_gpu_commit_carry;
+        phase.t_gpu_commit_carry_ns  += stats.t_gpu_commit_carry_ns;
+        phase.n_worker_loads         += stats.n_worker_loads;
+        phase.t_worker_queue_us      += stats.t_worker_queue_us;
+        phase.t_worker_read_us       += stats.t_worker_read_us;
+        phase.t_worker_upload_us     += stats.t_worker_upload_us;
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1471,7 +1560,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status, false);
+    const auto * res = process_ubatch(
+            ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status, false, false);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -1877,7 +1967,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(
-                ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, n_tokens_all > 1);
+                ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
+                n_tokens_all > 1, n_tokens_all == 1);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2450,7 +2541,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                  bool     moe_stream_gpu_decode) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2464,6 +2556,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.mstream     =*/ model.moe_stream(),
+        /*.moe_stream_gpu_decode =*/ moe_stream_gpu_decode,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2490,7 +2583,13 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    moe_stream_callback_failed = false;
+    eval_callback_user_requested.clear();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (status == GGML_STATUS_SUCCESS && moe_stream_callback_failed) {
+        status = GGML_STATUS_FAILED;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -3269,6 +3368,101 @@ void llama_context::moe_stream_stats_print() const {
 
     print_phase("prefill", moe_stats_prefill.n_hit, moe_stats_prefill.n_miss);
     print_phase("decode",  moe_stats_decode.n_hit,  moe_stats_decode.n_miss);
+
+    const auto print_gpu_hit_profile = [](const char * phase, const auto & stats) {
+        if (stats.n_gpu_hit_plans == 0) {
+            return;
+        }
+        const double count = (double) stats.n_gpu_hit_plans;
+        const double host_gap_ms = std::max(0.0,
+                stats.t_gpu_hit_wall_us/1000.0 - stats.t_gpu_hit_segment_ns/1000000.0);
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-hit] plans=%" PRId64
+                " segment_wall=%.3f ms (%.3f ms/plan) segment_gpu=%.3f ms (%.3f ms/plan)"
+                " host_gap=%.3f ms (%.3f ms/plan) planner_gpu=%.3f ms (%.3f ms/plan)"
+                " sync_wait=%.3f ms (%.3f ms/plan)"
+                " callback=%.3f ms (%.3f ms/plan)"
+                " prepare=%.3f ms (%.3f ms/plan) commit=%.3f ms (%.3f ms/plan)\n",
+                phase, stats.n_gpu_hit_plans,
+                stats.t_gpu_hit_wall_us/1000.0, stats.t_gpu_hit_wall_us/1000.0/count,
+                stats.t_gpu_hit_segment_ns/1000000.0, stats.t_gpu_hit_segment_ns/1000000.0/count,
+                host_gap_ms, host_gap_ms/count,
+                stats.t_gpu_hit_planner_ns/1000000.0, stats.t_gpu_hit_planner_ns/1000000.0/count,
+                stats.t_gpu_hit_sync_us/1000.0, stats.t_gpu_hit_sync_us/1000.0/count,
+                stats.t_gpu_hit_cb_us/1000.0, stats.t_gpu_hit_cb_us/1000.0/count,
+                stats.t_gpu_hit_prepare_us/1000.0, stats.t_gpu_hit_prepare_us/1000.0/count,
+                stats.t_gpu_hit_commit_us/1000.0, stats.t_gpu_hit_commit_us/1000.0/count);
+    };
+    const auto print_gpu_slow_profile = [](const char * phase, const auto & stats) {
+        if (stats.n_gpu_slow_plans == 0) {
+            return;
+        }
+        const double count = (double) stats.n_gpu_slow_plans;
+        const double host_gap_ms = std::max(0.0,
+                stats.t_gpu_slow_wall_us/1000.0 - stats.t_gpu_slow_segment_ns/1000000.0);
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-slow] plans=%" PRId64 " loads=%" PRId64
+                " segment_wall=%.3f ms (%.3f ms/plan) segment_gpu=%.3f ms (%.3f ms/plan)"
+                " host_gap=%.3f ms (%.3f ms/plan) planner_gpu=%.3f ms (%.3f ms/plan)"
+                " sync_wait=%.3f ms (%.3f ms/plan)"
+                " load_wait=%.3f ms (%.3f ms/plan) callback=%.3f ms (%.3f ms/plan)"
+                " prepare=%.3f ms (%.3f ms/plan) commit=%.3f ms (%.3f ms/plan)\n",
+                phase, stats.n_gpu_slow_plans, stats.n_gpu_slow_loads,
+                stats.t_gpu_slow_wall_us/1000.0, stats.t_gpu_slow_wall_us/1000.0/count,
+                stats.t_gpu_slow_segment_ns/1000000.0, stats.t_gpu_slow_segment_ns/1000000.0/count,
+                host_gap_ms, host_gap_ms/count,
+                stats.t_gpu_slow_planner_ns/1000000.0, stats.t_gpu_slow_planner_ns/1000000.0/count,
+                stats.t_gpu_slow_sync_us/1000.0, stats.t_gpu_slow_sync_us/1000.0/count,
+                stats.t_gpu_slow_load_us/1000.0, stats.t_gpu_slow_load_us/1000.0/count,
+                stats.t_gpu_slow_cb_us/1000.0, stats.t_gpu_slow_cb_us/1000.0/count,
+                stats.t_gpu_slow_prepare_us/1000.0, stats.t_gpu_slow_prepare_us/1000.0/count,
+                stats.t_gpu_slow_commit_us/1000.0, stats.t_gpu_slow_commit_us/1000.0/count);
+    };
+    print_gpu_hit_profile("prefill", moe_stats_prefill);
+    print_gpu_hit_profile("decode",  moe_stats_decode);
+    print_gpu_slow_profile("prefill", moe_stats_prefill);
+    print_gpu_slow_profile("decode",  moe_stats_decode);
+
+    const auto print_gpu_carry_profile = [](const char * phase, const auto & stats) {
+        if (stats.n_gpu_commit_carry == 0) {
+            return;
+        }
+        const double count = (double) stats.n_gpu_commit_carry;
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-carry] commits=%" PRId64
+                " commit_gpu=%.3f ms (%.3f ms/commit)\n",
+                phase, stats.n_gpu_commit_carry,
+                stats.t_gpu_commit_carry_ns/1000000.0,
+                stats.t_gpu_commit_carry_ns/1000000.0/count);
+    };
+    const auto print_gpu_load_detail = [](const char * phase, const auto & stats) {
+        if (stats.n_gpu_slow_plans == 0) {
+            return;
+        }
+        const double plans = (double) stats.n_gpu_slow_plans;
+        const double loads = (double) std::max<int64_t>(1, stats.n_worker_loads);
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-load-detail] new_loads=%" PRId64
+                " waiting=%" PRId64 " resident_wait=%.3f ms (%.3f ms/plan)"
+                " worker_loads=%" PRId64 " queue=%.3f ms (%.3f ms/load)"
+                " read=%.3f ms (%.3f ms/load) upload=%.3f ms (%.3f ms/load)\n",
+                phase, stats.n_gpu_slow_loads, stats.n_gpu_slow_waiting,
+                stats.t_gpu_slow_resident_wait_us/1000.0,
+                stats.t_gpu_slow_resident_wait_us/1000.0/plans,
+                stats.n_worker_loads,
+                stats.t_worker_queue_us/1000.0, stats.t_worker_queue_us/1000.0/loads,
+                stats.t_worker_read_us/1000.0, stats.t_worker_read_us/1000.0/loads,
+                stats.t_worker_upload_us/1000.0, stats.t_worker_upload_us/1000.0/loads);
+    };
+    print_gpu_carry_profile("prefill", moe_stats_prefill);
+    print_gpu_carry_profile("decode",  moe_stats_decode);
+    print_gpu_load_detail("prefill", moe_stats_prefill);
+    print_gpu_load_detail("decode",  moe_stats_decode);
+
+    if (model.moe_stream()->shadow) {
+        const auto print_shadow = [](const char * phase, int64_t plans, int64_t mismatches) {
+            std::fprintf(stderr, "[MOE_STREAM_SHADOW][%s] plans=%" PRId64 " matched=%" PRId64
+                    " mismatched=%" PRId64 "\n", phase, plans, plans - mismatches, mismatches);
+        };
+        print_shadow("prefill", moe_stats_prefill.n_shadow_plans, moe_stats_prefill.n_shadow_mismatches);
+        print_shadow("decode",  moe_stats_decode.n_shadow_plans,  moe_stats_decode.n_shadow_mismatches);
+    }
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {

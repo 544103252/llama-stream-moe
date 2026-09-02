@@ -222,6 +222,88 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    struct ggml_backend_moe_stream_cache_load {
+        int32_t expert;
+        int32_t victim;
+        int32_t slot;
+    };
+
+    // The backend owns the loads storage until commit or abort.
+    struct ggml_backend_moe_stream_cache_plan {
+        const struct ggml_backend_moe_stream_cache_load * loads;
+        size_t n_loads;
+        size_t n_required;
+        size_t n_waiting;
+        const int32_t * required_slots;
+        size_t n_required_slots;
+        const int32_t * mapped_topk;
+        size_t n_mapped_topk;
+        const int32_t * next_map;
+        size_t n_next_map;
+        uint64_t t_gpu_segment_ns;
+        uint64_t t_gpu_planner_ns;
+        uint64_t t_gpu_commit_carry_ns;
+        uint32_t n_gpu_commit_carry;
+    };
+
+    struct ggml_backend_moe_stream_cache_state {
+        int32_t layer;
+        uint32_t n_expert;
+        uint32_t n_slots;
+        const int32_t * expert_map;
+        const int32_t * available_map;
+        const int32_t * slot_expert;
+        const uint8_t * slot_state;
+        const uint32_t * route_hotness;
+        const int64_t * slot_last_use;
+        uint64_t use_counter;
+        int64_t n_calls;
+        int64_t hot_decay_interval;
+    };
+
+    struct ggml_backend_moe_stream_cache_ops {
+        bool (*sync)(
+                ggml_backend_t backend,
+                const struct ggml_backend_moe_stream_cache_state * state);
+        bool (*read_policy)(
+                ggml_backend_t backend,
+                int layer,
+                uint32_t * route_hotness,
+                size_t n_expert,
+                int64_t * slot_last_use,
+                size_t n_slots,
+                uint64_t * use_counter);
+        bool (*prepare)(
+                ggml_backend_t backend,
+                const struct ggml_tensor * decision,
+                struct ggml_backend_moe_stream_cache_plan * plan);
+        bool (*commit)(
+                ggml_backend_t backend,
+                int layer);
+        void (*abort)(
+                ggml_backend_t backend,
+                int layer);
+        bool (*supports_continuous)(
+                ggml_backend_t backend);
+        bool (*continuous_begin)(
+                ggml_backend_t backend,
+                bool resume);
+        bool (*continuous_wait)(
+                ggml_backend_t backend);
+        bool (*continuous_resume)(
+                ggml_backend_t backend,
+                int32_t layer);
+        bool (*continuous_status)(
+                ggml_backend_t backend,
+                int32_t * miss_layer,
+                size_t * n_hit_plans);
+        void (*continuous_end)(
+                ggml_backend_t backend);
+    };
+
+    typedef const struct ggml_backend_moe_stream_cache_ops *
+        (*ggml_backend_get_moe_stream_cache_ops_t)(void);
+
     //
     // Backend registry
     //
@@ -350,6 +432,10 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_moe_stream_continuous(ggml_backend_sched_t sched, bool enabled);
+    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_hit_plans(ggml_backend_sched_t sched);
+    GGML_API int64_t              ggml_backend_sched_get_last_eval_callback_sync_us(ggml_backend_sched_t sched);
+    GGML_API int64_t              ggml_backend_sched_get_last_eval_callback_segment_us(ggml_backend_sched_t sched);
 
     //
     // Meta backend
