@@ -1352,6 +1352,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mstream          (params.mstream),
+    moe_stream_gpu_decode(params.moe_stream_gpu_decode),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1993,8 +1994,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_gemm = selected_experts;
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
-        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
-        cb(ids_gemm, "ffn_moe_topk_stream", il);
+        if (moe_stream_gpu_decode) {
+            ids_gemm = ggml_moe_stream_cache_decide(
+                    ctx0, ids_cont, il, msl->n_expert, msl->n_slots);
+            cb(ids_gemm, "ffn_moe_stream_cache_decide", il);
+        } else {
+            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+            cb(ids_gemm, "ffn_moe_topk_stream", il);
+        }
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);

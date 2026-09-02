@@ -1,0 +1,254 @@
+#version 450
+
+layout(push_constant) uniform parameter {
+    uint n_expert;
+    uint n_slots;
+    uint n_selected;
+    uint mode;
+    uint decay;
+    int layer;
+} p;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0,  std430) readonly buffer Selected     { int selected[]; };
+layout(binding = 1,  std430)          buffer ExpertMap    { int expert_map[]; };
+layout(binding = 2,  std430)          buffer AvailableMap { int available_map[]; };
+layout(binding = 3,  std430)          buffer SlotExpert   { int slot_expert[]; };
+layout(binding = 4,  std430)          buffer SlotState    { uint slot_state[]; };
+layout(binding = 5,  std430)          buffer Hotness      { uint hotness[]; };
+layout(binding = 6,  std430)          buffer LastUse      { uint last_use[]; };
+layout(binding = 7,  std430)          buffer NextMap      { int next_map[]; };
+layout(binding = 8,  std430)          buffer Loads        { int loads[]; };
+layout(binding = 9,  std430)          buffer MappedTopk   { int mapped_topk[]; };
+layout(binding = 10, std430)          buffer Meta         { int meta[]; };
+layout(binding = 11, std430)          buffer UseCounter   { uint use_counter[]; };
+
+const uint HIT_PREDICATE_INDEX = 6;
+const uint PLAN_LAYER_INDEX = 7;
+
+const uint SLOT_EMPTY = 0;
+const uint SLOT_LOADING = 1;
+const uint SLOT_RESIDENT = 2;
+
+void fail(int status, int detail) {
+    meta[0] = status;
+    meta[1] = 0;
+    meta[3] = detail;
+    meta[HIT_PREDICATE_INDEX] = 0;
+    meta[PLAN_LAYER_INDEX] = p.layer;
+}
+
+bool is_first_use(uint index, int expert) {
+    for (uint i = 0; i < index; ++i) {
+        if (selected[i] == expert) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool slot_is_kept(uint slot, uint selected_end) {
+    for (uint i = 0; i < selected_end; ++i) {
+        const int expert = selected[i];
+        if (expert >= 0 && expert < int(p.n_expert) && next_map[expert] == int(slot)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool older(uint lhs, uint rhs) {
+    const uint lhs_lo = last_use[2 * lhs + 0];
+    const uint lhs_hi = last_use[2 * lhs + 1];
+    const uint rhs_lo = last_use[2 * rhs + 0];
+    const uint rhs_hi = last_use[2 * rhs + 1];
+    return lhs_hi < rhs_hi || (lhs_hi == rhs_hi && lhs_lo < rhs_lo);
+}
+
+void touch_slot(uint slot) {
+    uint lo = use_counter[0] + 1;
+    uint hi = use_counter[1];
+    if (lo == 0) {
+        ++hi;
+    }
+    use_counter[0] = lo;
+    use_counter[1] = hi;
+    last_use[2 * slot + 0] = lo;
+    last_use[2 * slot + 1] = hi;
+}
+
+void main() {
+    if (p.mode == 1) {
+        for (uint slot = 0; slot < p.n_slots; ++slot) {
+            slot_expert[slot] = -1;
+            slot_state[slot] = SLOT_EMPTY;
+        }
+        for (uint expert = 0; expert < p.n_expert; ++expert) {
+            expert_map[expert] = next_map[expert];
+            available_map[expert] = next_map[expert];
+            if (next_map[expert] >= 0) {
+                slot_expert[next_map[expert]] = int(expert);
+                slot_state[next_map[expert]] = SLOT_RESIDENT;
+            }
+        }
+        meta[HIT_PREDICATE_INDEX] = 1;
+        return;
+    }
+
+    if (p.mode == 2) {
+        for (uint expert = 0; expert < p.n_expert; ++expert) {
+            hotness[expert] >>= 1;
+        }
+        return;
+    }
+
+    meta[0] = 0;
+    meta[1] = 0;
+    meta[2] = 0;
+    meta[3] = 0;
+    meta[4] = 0;
+    meta[5] = int(p.n_selected);
+    meta[HIT_PREDICATE_INDEX] = 0;
+    meta[PLAN_LAYER_INDEX] = p.layer;
+
+    bool all_resident = true;
+    uint n_required = 0;
+    uint n_waiting = 0;
+    for (uint i = 0; i < p.n_selected; ++i) {
+        const int expert = selected[i];
+        if (expert < 0 || expert >= int(p.n_expert)) {
+            fail(1, expert);
+            return;
+        }
+        if (!is_first_use(i, expert)) {
+            continue;
+        }
+        ++n_required;
+        const int current_slot = p.mode == 3 ? expert_map[expert] : available_map[expert];
+        all_resident = all_resident && current_slot >= 0;
+        if (p.mode == 3 && expert_map[expert] < 0 && available_map[expert] >= 0) {
+            ++n_waiting;
+        }
+        if (p.mode == 3 && hotness[expert] < 0xfffffffeu) {
+            ++hotness[expert];
+        }
+    }
+
+    meta[2] = int(n_required);
+    meta[4] = int(n_waiting);
+    if (n_required > p.n_slots) {
+        fail(2, int(n_required));
+        return;
+    }
+
+    if (p.mode == 3 && p.decay != 0) {
+        for (uint expert = 0; expert < p.n_expert; ++expert) {
+            hotness[expert] >>= 1;
+        }
+    }
+
+    if (all_resident) {
+        for (uint i = 0; i < p.n_selected; ++i) {
+            const int slot = p.mode == 3 ? expert_map[selected[i]] : available_map[selected[i]];
+            if (slot < 0 || slot >= int(p.n_slots)) {
+                fail(5, selected[i]);
+                return;
+            }
+            mapped_topk[i] = slot;
+            if (p.mode == 3) {
+                touch_slot(uint(slot));
+            }
+        }
+        if (p.mode == 3) {
+            meta[HIT_PREDICATE_INDEX] = 1;
+        }
+        return;
+    }
+
+    for (uint expert = 0; expert < p.n_expert; ++expert) {
+        next_map[expert] = expert_map[expert];
+    }
+    for (uint i = 0; i < p.n_selected; ++i) {
+        const int expert = selected[i];
+        if (available_map[expert] >= 0) {
+            next_map[expert] = available_map[expert];
+        }
+    }
+
+    uint n_loads = 0;
+    for (uint i = 0; i < p.n_selected; ++i) {
+        const int expert = selected[i];
+        if (!is_first_use(i, expert) || next_map[expert] >= 0) {
+            continue;
+        }
+
+        int victim_slot = -1;
+        for (uint slot = 0; slot < p.n_slots; ++slot) {
+            if (slot_state[slot] == SLOT_LOADING || slot_is_kept(slot, i)) {
+                continue;
+            }
+            if (slot_state[slot] == SLOT_EMPTY) {
+                victim_slot = int(slot);
+                break;
+            }
+            if (victim_slot < 0) {
+                victim_slot = int(slot);
+                continue;
+            }
+
+            const int candidate = slot_expert[slot];
+            const int victim = slot_expert[victim_slot];
+            if (candidate < 0 || candidate >= int(p.n_expert) || victim < 0 || victim >= int(p.n_expert)) {
+                fail(4, candidate < 0 ? candidate : victim);
+                return;
+            }
+            if (hotness[candidate] < hotness[victim] ||
+                    (hotness[candidate] == hotness[victim] && older(slot, uint(victim_slot)))) {
+                victim_slot = int(slot);
+            }
+        }
+
+        if (victim_slot < 0) {
+            fail(3, expert);
+            return;
+        }
+
+        const int victim = slot_state[victim_slot] == SLOT_EMPTY ? -1 : slot_expert[victim_slot];
+        if (victim >= 0) {
+            if (victim >= int(p.n_expert) || next_map[victim] != victim_slot) {
+                fail(4, victim);
+                return;
+            }
+            next_map[victim] = -1;
+        }
+
+        loads[3 * n_loads + 0] = expert;
+        loads[3 * n_loads + 1] = victim;
+        loads[3 * n_loads + 2] = victim_slot;
+        next_map[expert] = victim_slot;
+        if (p.mode == 3) {
+            touch_slot(uint(victim_slot));
+        }
+        ++n_loads;
+    }
+
+    uint required_index = 0;
+    for (uint i = 0; i < p.n_selected; ++i) {
+        const int expert = selected[i];
+        const int slot = next_map[expert];
+        if (slot < 0 || slot >= int(p.n_slots)) {
+            fail(5, expert);
+            return;
+        }
+        mapped_topk[i] = slot;
+        if (is_first_use(i, expert)) {
+            loads[3 * p.n_expert + required_index++] = slot;
+        }
+        if (p.mode == 3) {
+            touch_slot(uint(slot));
+        }
+    }
+
+    meta[1] = int(n_loads);
+}

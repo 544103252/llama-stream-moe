@@ -683,6 +683,8 @@ struct llm_graph_params {
     // MoE expert SSD streaming state of the model, null when not enabled
     llama_moe_stream * mstream = nullptr;
 
+    bool moe_stream_gpu_decode = false;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -741,6 +743,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (moe_stream_gpu_decode != other.moe_stream_gpu_decode) {
             return false;
         }
 
@@ -913,6 +919,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     llama_moe_stream * mstream;
+    const bool moe_stream_gpu_decode;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

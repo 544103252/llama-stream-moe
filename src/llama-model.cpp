@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1291,6 +1292,13 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
 
     if (n_slots == 0) {
         n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used, 16, hparams.n_expert);
+    }
+
+    const bool full_cache_test = std::getenv("LLAMA_MOE_STREAM_FULL_CACHE_TEST") != nullptr;
+    if (n_slots == hparams.n_expert && full_cache_test) {
+        LLAMA_LOG_WARN("%s: full-cache Stream MoE test enabled for all %u experts\n",
+                __func__, hparams.n_expert);
+        return n_slots;
     }
 
     if (n_slots >= hparams.n_expert) {
