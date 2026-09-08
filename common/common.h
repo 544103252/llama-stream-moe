@@ -536,6 +536,7 @@ struct common_params {
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
                                      //                                       (which is more convenient to use for plotting)
+    bool    ppl_tokenwise   = false; // evaluate with one token per llama_decode call
                                      //
     bool   hellaswag        = false; // compute HellaSwag score over random tasks from datafile supplied in prompt
     size_t hellaswag_tasks  = 400;   // number of tasks to use when computing the HellaSwag score

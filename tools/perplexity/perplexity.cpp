@@ -31,6 +31,13 @@ struct results_perplexity {
     std::vector<float>       probs;
 };
 
+static bool decode_helper(
+        llama_context *       ctx,
+        llama_batch &         batch,
+        std::vector<float> &  batch_logits,
+        int                   n_batch,
+        int                   n_vocab);
+
 struct results_log_softmax {
     double log_softmax;
     float  logit;
@@ -378,7 +385,14 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
             }
 
             //LOG_DBG("    Batch %d: starts at %d, size is %d, n_past is %d\n",j,batch_start,batch_size,j * n_batch);
-            if (llama_decode(ctx, batch)) {
+            std::vector<float> tokenwise_logits;
+            if (params.ppl_tokenwise) {
+                tokenwise_logits.resize(size_t(batch_size) * n_vocab);
+                if (!decode_helper(ctx, batch, tokenwise_logits, 1, n_vocab)) {
+                    llama_batch_free(batch);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+            } else if (llama_decode(ctx, batch)) {
                 //LOG_ERR("%s : failed to eval\n", __func__);
                 llama_batch_free(batch);
                 return {tokens, -1, logit_history, prob_history};
@@ -392,8 +406,12 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
                 tokens[batch_start] = llama_vocab_bos(vocab);
             }
 
-            const auto * batch_logits = llama_get_logits(ctx);
-            logits.insert(logits.end(), batch_logits, batch_logits + size_t(batch_size) * n_vocab);
+            if (params.ppl_tokenwise) {
+                logits.insert(logits.end(), tokenwise_logits.begin(), tokenwise_logits.end());
+            } else {
+                const auto * batch_logits = llama_get_logits(ctx);
+                logits.insert(logits.end(), batch_logits, batch_logits + size_t(batch_size) * n_vocab);
+            }
 
             if (j == 0) {
                 tokens[batch_start] = token_org;
@@ -586,12 +604,17 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 tokens[seq_start] = token_org;
             }
 
-            if (llama_decode(ctx, batch)) {
+            if (params.ppl_tokenwise) {
+                std::vector<float> tokenwise_logits(size_t(n_outputs) * n_vocab);
+                if (!decode_helper(ctx, batch, tokenwise_logits, 1, n_vocab)) {
+                    LOG_INF("%s : failed to decode\n", __func__);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+                logits.insert(logits.end(), tokenwise_logits.begin(), tokenwise_logits.end());
+            } else if (llama_decode(ctx, batch)) {
                 LOG_INF("%s : failed to decode\n", __func__);
                 return {tokens, -1, logit_history, prob_history};
-            }
-
-            if (num_batches > 1 && n_outputs > 0) {
+            } else if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
@@ -612,7 +635,12 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         }
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+            const float * all_logits = nullptr;
+            if (params.ppl_tokenwise) {
+                all_logits = logits.data() + size_t(seq) * (n_ctx - first) * n_vocab;
+            } else {
+                all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+            }
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
             if (!params.logits_file.empty()) {
@@ -687,7 +715,12 @@ static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<
             n_outputs += batch_view.logits[i] != 0;
         }
 
-        memcpy(batch_logits.data() + size_t(prev_outputs)*n_vocab, llama_get_logits(ctx), size_t(n_outputs)*n_vocab*sizeof(float));
+        if (n_outputs > 0) {
+            GGML_ASSERT(size_t(prev_outputs + n_outputs) * n_vocab <= batch_logits.size());
+            memcpy(batch_logits.data() + size_t(prev_outputs)*n_vocab, llama_get_logits(ctx), size_t(n_outputs)*n_vocab*sizeof(float));
+        } else if (n_batch == 1) {
+            llama_synchronize(ctx);
+        }
 
         prev_outputs += n_outputs;
     }
@@ -930,7 +963,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         llama_memory_clear(llama_get_memory(ctx), true);
 
         // decode all tasks [i0, i1)
-        if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
+        if (!decode_helper(ctx, batch, batch_logits, params.ppl_tokenwise ? 1 : n_batch, n_vocab)) {
             LOG_ERR("%s: llama_decode() failed\n", __func__);
             return;
         }
@@ -1223,7 +1256,7 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
         llama_memory_clear(llama_get_memory(ctx), true);
 
         // decode all tasks [i0, i1)
-        if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
+        if (!decode_helper(ctx, batch, batch_logits, params.ppl_tokenwise ? 1 : n_batch, n_vocab)) {
             LOG_ERR("%s: llama_decode() failed\n", __func__);
             return;
         }
@@ -1602,7 +1635,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
         llama_memory_clear(llama_get_memory(ctx), true);
 
         // decode all tasks [i0, i1)
-        if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
+        if (!decode_helper(ctx, batch, batch_logits, params.ppl_tokenwise ? 1 : n_batch, n_vocab)) {
             LOG_ERR("%s: llama_decode() failed\n", __func__);
             return;
         }
@@ -2020,6 +2053,10 @@ int llama_perplexity(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
         return 1;
+    }
+
+    if (params.ppl_tokenwise) {
+        LOG_INF("%s: tokenwise evaluation enabled\n", __func__);
     }
 
     const int32_t n_ctx = params.n_ctx;

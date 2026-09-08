@@ -155,6 +155,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
             gpu_decode_continuous_window = (int32_t) std::min<long>(parsed, INT32_MAX);
         }
     }
+    if (const char * value = std::getenv("LLAMA_MOE_STREAM_GPU_ROLLING")) {
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed > 0) {
+            gpu_decode_rolling_lookahead = (int32_t) std::min<long>(parsed, INT32_MAX);
+            gpu_decode_continuous_window = INT32_MAX;
+        }
+    }
     use_direct_io = direct;
 }
 
@@ -365,7 +372,10 @@ void llama_moe_stream::bind_decode_backends(const std::vector<ggml_backend_t> & 
     if (gpu_decode) {
         LLAMA_LOG_INFO("%s: Stream MoE GPU decode planner enabled\n", __func__);
         if (gpu_decode_continuous) {
-            if (gpu_decode_continuous_window == INT32_MAX) {
+            if (gpu_decode_rolling_lookahead > 0) {
+                LLAMA_LOG_INFO("%s: Stream MoE rolling GPU decode enabled (lookahead=%d plans)\n",
+                        __func__, gpu_decode_rolling_lookahead);
+            } else if (gpu_decode_continuous_window == INT32_MAX) {
                 LLAMA_LOG_INFO("%s: Stream MoE continuous GPU decode enabled (full graph)\n", __func__);
             } else {
                 LLAMA_LOG_INFO("%s: Stream MoE continuous GPU decode enabled (window=%d plans)\n",
@@ -406,6 +416,54 @@ void llama_moe_stream::record_continuous_hits(size_t n_plans) {
     if (token_stats_active) {
         token_stats.n_hit += n_plans;
     }
+}
+
+void llama_moe_stream::record_continuous_resume_submit(size_t n_resumes, int64_t time_us) {
+    if (n_resumes == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!token_stats_active) {
+        return;
+    }
+    token_stats.n_gpu_slow_resume_submit += (int64_t) n_resumes;
+    token_stats.t_gpu_slow_resume_submit_us += time_us;
+}
+
+void llama_moe_stream::record_continuous_submit_profile(
+        size_t n_graph_calls,
+        int64_t submit_front_us,
+        int64_t record_tail_us,
+        size_t n_vk_submits,
+        int64_t vk_submit_us,
+        size_t n_submit_gaps,
+        int64_t submit_gap_ns) {
+    if (n_graph_calls == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!token_stats_active) {
+        return;
+    }
+    token_stats.n_gpu_submit_graph_calls += (int64_t) n_graph_calls;
+    token_stats.t_gpu_submit_front_us += submit_front_us;
+    token_stats.t_gpu_record_tail_us += record_tail_us;
+    token_stats.n_gpu_vk_submits += (int64_t) n_vk_submits;
+    token_stats.t_gpu_vk_submit_us += vk_submit_us;
+    token_stats.n_gpu_submit_gaps += (int64_t) n_submit_gaps;
+    token_stats.t_gpu_submit_gap_ns += submit_gap_ns;
+}
+
+void llama_moe_stream::record_continuous_window_gaps(size_t n_gaps, int64_t time_ns) {
+    if (n_gaps == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!token_stats_active) {
+        return;
+    }
+    token_stats.n_gpu_window_gaps += (int64_t) n_gaps;
+    token_stats.t_gpu_window_gap_ns += time_ns;
 }
 
 bool llama_moe_stream::prepare_decode() {
@@ -1256,6 +1314,10 @@ bool llama_moe_stream::eval_callback(
         token_stats.t_gpu_slow_prepare_us += prepare_us;
         token_stats.t_gpu_slow_load_us += load_us;
         token_stats.t_gpu_slow_commit_us += commit_us;
+        if (gpu.t_gpu_skip_tail_ns > 0) {
+            token_stats.n_gpu_slow_skip_tail++;
+            token_stats.t_gpu_slow_skip_tail_ns += gpu.t_gpu_skip_tail_ns;
+        }
         token_stats.n_gpu_slow_waiting += gpu.n_waiting;
         token_stats.t_gpu_slow_resident_wait_us += resident_wait_us;
     }

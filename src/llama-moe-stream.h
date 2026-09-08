@@ -159,6 +159,19 @@ struct llama_moe_stream_token_stats {
     int64_t t_gpu_slow_prepare_us = 0;
     int64_t t_gpu_slow_load_us    = 0;
     int64_t t_gpu_slow_commit_us  = 0;
+    int64_t n_gpu_slow_skip_tail  = 0;
+    int64_t t_gpu_slow_skip_tail_ns = 0;
+    int64_t n_gpu_slow_resume_submit = 0;
+    int64_t t_gpu_slow_resume_submit_us = 0;
+    int64_t n_gpu_submit_graph_calls = 0;
+    int64_t t_gpu_submit_front_us    = 0;
+    int64_t t_gpu_record_tail_us     = 0;
+    int64_t n_gpu_vk_submits         = 0;
+    int64_t t_gpu_vk_submit_us       = 0;
+    int64_t n_gpu_submit_gaps        = 0;
+    int64_t t_gpu_submit_gap_ns      = 0;
+    int64_t n_gpu_window_gaps        = 0;
+    int64_t t_gpu_window_gap_ns      = 0;
     int64_t n_gpu_slow_waiting     = 0;
     int64_t t_gpu_slow_resident_wait_us = 0;
     int64_t n_gpu_commit_carry     = 0;
@@ -194,6 +207,16 @@ struct llama_moe_stream {
     void unbind_decode_backends();
     bool prepare_decode();
     void record_continuous_hits(size_t n_plans);
+    void record_continuous_resume_submit(size_t n_resumes, int64_t time_us);
+    void record_continuous_submit_profile(
+            size_t n_graph_calls,
+            int64_t submit_front_us,
+            int64_t record_tail_us,
+            size_t n_vk_submits,
+            int64_t vk_submit_us,
+            size_t n_submit_gaps,
+            int64_t submit_gap_ns);
+    void record_continuous_window_gaps(size_t n_gaps, int64_t time_ns);
     bool eval_callback(
             ggml_backend_sched_t sched,
             ggml_tensor * tensor,
@@ -240,6 +263,7 @@ struct llama_moe_stream {
     bool gpu_decode_continuous_requested = false;
     bool gpu_decode_continuous = false;
     int32_t gpu_decode_continuous_window = INT32_MAX;
+    int32_t gpu_decode_rolling_lookahead = 0;
     bool gpu_decode_state_ready = false;
     bool gpu_decode_cpu_policy_stale = false;
 

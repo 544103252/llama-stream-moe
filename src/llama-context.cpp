@@ -1390,8 +1390,11 @@ llm_graph_result * llama_context::process_ubatch(
             model.moe_stream()->gpu_decode_continuous && cparams.cb_eval == nullptr;
     const int moe_stream_continuous_window = moe_stream_continuous ?
             model.moe_stream()->gpu_decode_continuous_window : 0;
+    const int moe_stream_rolling_lookahead = moe_stream_continuous ?
+            model.moe_stream()->gpu_decode_rolling_lookahead : 0;
     ggml_backend_sched_set_moe_stream_continuous(
-            sched.get(), moe_stream_continuous, moe_stream_continuous_window);
+            sched.get(), moe_stream_continuous, moe_stream_continuous_window,
+            moe_stream_rolling_lookahead);
     const auto gparams = graph_params(res, ubatch, mctx, gtype, gpu_decode_active);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
@@ -1454,6 +1457,20 @@ llm_graph_result * llama_context::process_ubatch(
     if (status == GGML_STATUS_SUCCESS && mstream && moe_stream_continuous) {
         mstream->record_continuous_hits(
                 (size_t) ggml_backend_sched_get_last_moe_stream_hit_plans(sched.get()));
+        mstream->record_continuous_resume_submit(
+                (size_t) ggml_backend_sched_get_last_moe_stream_resume_count(sched.get()),
+                ggml_backend_sched_get_last_moe_stream_resume_submit_us(sched.get()));
+        mstream->record_continuous_submit_profile(
+                (size_t) ggml_backend_sched_get_last_moe_stream_graph_call_count(sched.get()),
+                ggml_backend_sched_get_last_moe_stream_submit_front_us(sched.get()),
+                ggml_backend_sched_get_last_moe_stream_record_tail_us(sched.get()),
+                (size_t) ggml_backend_sched_get_last_moe_stream_vk_submit_count(sched.get()),
+                ggml_backend_sched_get_last_moe_stream_vk_submit_us(sched.get()),
+                (size_t) ggml_backend_sched_get_last_moe_stream_submit_gap_count(sched.get()),
+                ggml_backend_sched_get_last_moe_stream_submit_gap_ns(sched.get()));
+        mstream->record_continuous_window_gaps(
+                (size_t) ggml_backend_sched_get_last_moe_stream_window_gap_count(sched.get()),
+                ggml_backend_sched_get_last_moe_stream_window_gap_ns(sched.get()));
     }
 
     if (mstream) {
@@ -1481,6 +1498,19 @@ llm_graph_result * llama_context::process_ubatch(
         phase.t_gpu_slow_prepare_us += stats.t_gpu_slow_prepare_us;
         phase.t_gpu_slow_load_us    += stats.t_gpu_slow_load_us;
         phase.t_gpu_slow_commit_us  += stats.t_gpu_slow_commit_us;
+        phase.n_gpu_slow_skip_tail  += stats.n_gpu_slow_skip_tail;
+        phase.t_gpu_slow_skip_tail_ns += stats.t_gpu_slow_skip_tail_ns;
+        phase.n_gpu_slow_resume_submit += stats.n_gpu_slow_resume_submit;
+        phase.t_gpu_slow_resume_submit_us += stats.t_gpu_slow_resume_submit_us;
+        phase.n_gpu_submit_graph_calls += stats.n_gpu_submit_graph_calls;
+        phase.t_gpu_submit_front_us    += stats.t_gpu_submit_front_us;
+        phase.t_gpu_record_tail_us     += stats.t_gpu_record_tail_us;
+        phase.n_gpu_vk_submits         += stats.n_gpu_vk_submits;
+        phase.t_gpu_vk_submit_us       += stats.t_gpu_vk_submit_us;
+        phase.n_gpu_submit_gaps        += stats.n_gpu_submit_gaps;
+        phase.t_gpu_submit_gap_ns      += stats.t_gpu_submit_gap_ns;
+        phase.n_gpu_window_gaps        += stats.n_gpu_window_gaps;
+        phase.t_gpu_window_gap_ns      += stats.t_gpu_window_gap_ns;
         phase.n_gpu_slow_waiting     += stats.n_gpu_slow_waiting;
         phase.t_gpu_slow_resident_wait_us += stats.t_gpu_slow_resident_wait_us;
         phase.n_gpu_commit_carry     += stats.n_gpu_commit_carry;
@@ -3407,7 +3437,7 @@ void llama_context::moe_stream_stats_print() const {
                 " host_gap=%.3f ms (%.3f ms/plan) planner_gpu=%.3f ms (%.3f ms/plan)"
                 " sync_wait=%.3f ms (%.3f ms/plan)"
                 " load_wait=%.3f ms (%.3f ms/plan) callback=%.3f ms (%.3f ms/plan)"
-                " prepare=%.3f ms (%.3f ms/plan) commit=%.3f ms (%.3f ms/plan)\n",
+                " prepare=%.3f ms (%.3f ms/plan) commit=%.3f ms (%.3f ms/plan)",
                 phase, stats.n_gpu_slow_plans, stats.n_gpu_slow_loads,
                 stats.t_gpu_slow_wall_us/1000.0, stats.t_gpu_slow_wall_us/1000.0/count,
                 stats.t_gpu_slow_segment_ns/1000000.0, stats.t_gpu_slow_segment_ns/1000000.0/count,
@@ -3418,6 +3448,53 @@ void llama_context::moe_stream_stats_print() const {
                 stats.t_gpu_slow_cb_us/1000.0, stats.t_gpu_slow_cb_us/1000.0/count,
                 stats.t_gpu_slow_prepare_us/1000.0, stats.t_gpu_slow_prepare_us/1000.0/count,
                 stats.t_gpu_slow_commit_us/1000.0, stats.t_gpu_slow_commit_us/1000.0/count);
+        if (stats.n_gpu_slow_skip_tail > 0) {
+            const double skip_count = (double) stats.n_gpu_slow_skip_tail;
+            std::fprintf(stderr, " skip_tail_gpu=%.3f ms (%.3f ms/miss)",
+                    stats.t_gpu_slow_skip_tail_ns/1000000.0,
+                    stats.t_gpu_slow_skip_tail_ns/1000000.0/skip_count);
+        }
+        if (stats.n_gpu_slow_resume_submit > 0) {
+            const double resume_count = (double) stats.n_gpu_slow_resume_submit;
+            std::fprintf(stderr, " resume_submit=%.3f ms (%.3f ms/miss)",
+                    stats.t_gpu_slow_resume_submit_us/1000.0,
+                    stats.t_gpu_slow_resume_submit_us/1000.0/resume_count);
+        }
+        if (stats.n_gpu_submit_graph_calls > 0) {
+            const double graph_calls = (double) stats.n_gpu_submit_graph_calls;
+            std::fprintf(stderr,
+                    " submit_front=%.3f ms (%.3f ms/graph, graphs=%" PRId64 ")"
+                    " record_tail=%.3f ms (%.3f ms/graph)",
+                    stats.t_gpu_submit_front_us/1000.0,
+                    stats.t_gpu_submit_front_us/1000.0/graph_calls,
+                    stats.n_gpu_submit_graph_calls,
+                    stats.t_gpu_record_tail_us/1000.0,
+                    stats.t_gpu_record_tail_us/1000.0/graph_calls);
+        }
+        if (stats.n_gpu_vk_submits > 0) {
+            const double vk_submits = (double) stats.n_gpu_vk_submits;
+            std::fprintf(stderr, " vk_submit_cpu=%.3f ms (%.3f ms/call, calls=%" PRId64 ")",
+                    stats.t_gpu_vk_submit_us/1000.0,
+                    stats.t_gpu_vk_submit_us/1000.0/vk_submits,
+                    stats.n_gpu_vk_submits);
+        }
+        if (stats.n_gpu_submit_gaps > 0) {
+            const double submit_gaps = (double) stats.n_gpu_submit_gaps;
+            std::fprintf(stderr, " submit_gap_gpu=%.3f ms (%.3f ms/gap, gaps=%" PRId64 ")",
+                    stats.t_gpu_submit_gap_ns/1000000.0,
+                    stats.t_gpu_submit_gap_ns/1000000.0/submit_gaps,
+                    stats.n_gpu_submit_gaps);
+        }
+        if (stats.n_gpu_window_gaps > 0) {
+            const double gap_count = (double) stats.n_gpu_window_gaps;
+            std::fprintf(stderr, " window_gap_gpu=%.3f ms (%.3f ms/boundary, boundaries=%" PRId64 ")",
+                    stats.t_gpu_window_gap_ns/1000000.0,
+                    stats.t_gpu_window_gap_ns/1000000.0/gap_count,
+                    stats.n_gpu_window_gaps);
+        } else {
+            std::fprintf(stderr, " window_gap_gpu=0.000 ms (boundaries=0)");
+        }
+        std::fprintf(stderr, "\n");
     };
     print_gpu_hit_profile("prefill", moe_stats_prefill);
     print_gpu_hit_profile("decode",  moe_stats_decode);

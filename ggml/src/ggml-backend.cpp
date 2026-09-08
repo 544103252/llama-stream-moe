@@ -816,7 +816,19 @@ struct ggml_backend_sched {
     int64_t callback_eval_segment_us;
     bool moe_stream_continuous;
     int moe_stream_continuous_max_plans;
+    int moe_stream_rolling_lookahead;
     int64_t moe_stream_hit_plans;
+    int64_t moe_stream_resume_submit_us;
+    int64_t moe_stream_resume_count;
+    int64_t moe_stream_submit_front_us;
+    int64_t moe_stream_record_tail_us;
+    int64_t moe_stream_vk_submit_us;
+    int64_t moe_stream_graph_call_count;
+    int64_t moe_stream_vk_submit_count;
+    int64_t moe_stream_submit_gap_ns;
+    int64_t moe_stream_submit_gap_count;
+    int64_t moe_stream_window_gap_ns;
+    int64_t moe_stream_window_gap_count;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1548,6 +1560,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
 
     sched->moe_stream_hit_plans = 0;
+    sched->moe_stream_resume_submit_us = 0;
+    sched->moe_stream_resume_count = 0;
+    sched->moe_stream_submit_front_us = 0;
+    sched->moe_stream_record_tail_us = 0;
+    sched->moe_stream_vk_submit_us = 0;
+    sched->moe_stream_graph_call_count = 0;
+    sched->moe_stream_vk_submit_count = 0;
+    sched->moe_stream_submit_gap_ns = 0;
+    sched->moe_stream_submit_gap_count = 0;
+    sched->moe_stream_window_gap_ns = 0;
+    sched->moe_stream_window_gap_count = 0;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1699,7 +1722,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const ggml_backend_moe_stream_cache_ops * ops = get_ops ? get_ops() : nullptr;
             if (ops == nullptr || ops->continuous_begin == nullptr || ops->continuous_wait == nullptr ||
                     ops->continuous_resume == nullptr || ops->continuous_status == nullptr ||
-                    ops->continuous_end == nullptr || sched->callback_eval == nullptr) {
+                    ops->continuous_end == nullptr || ops->continuous_window_gaps == nullptr ||
+                    ops->continuous_submit_profile == nullptr ||
+                    sched->callback_eval == nullptr) {
                 GGML_LOG_ERROR("%s: backend does not support continuous Stream MoE execution\n", __func__);
                 return GGML_STATUS_FAILED;
             }
@@ -1721,20 +1746,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 GGML_ASSERT(n_plans > 0);
 
                 struct ggml_cgraph window = ggml_graph_view(&split->graph, window_begin, window_end);
-                if (!ops->continuous_begin(split_backend, false)) {
+                if (!ops->continuous_begin(
+                            split_backend, window_begin != 0, sched->moe_stream_rolling_lookahead)) {
                     GGML_LOG_ERROR("%s: failed to begin continuous Stream MoE execution\n", __func__);
                     return GGML_STATUS_FAILED;
                 }
                 const auto end_continuous = [&] { ops->continuous_end(split_backend); };
                 int64_t segment_start_us = ggml_time_us();
+                int64_t resume_start_us = 0;
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &window);
                 if (ec != GGML_STATUS_SUCCESS) {
                     end_continuous();
                     return ec;
                 }
-
                 while (true) {
                     const int64_t sync_start_us = ggml_time_us();
+                    if (resume_start_us != 0) {
+                        sched->moe_stream_resume_submit_us += sync_start_us - resume_start_us;
+                        sched->moe_stream_resume_count++;
+                        resume_start_us = 0;
+                    }
                     if (!ops->continuous_wait(split_backend)) {
                         GGML_LOG_ERROR("%s: failed to wait for continuous Stream MoE execution\n", __func__);
                         end_continuous();
@@ -1775,6 +1806,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         end_continuous();
                         return GGML_STATUS_FAILED;
                     }
+                    resume_start_us = ggml_time_us();
                     if (!ops->continuous_resume(split_backend, miss_layer)) {
                         GGML_LOG_ERROR("%s: failed to resume continuous Stream MoE execution after layer %d\n",
                                 __func__, miss_layer);
@@ -1786,6 +1818,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 window_begin = window_end;
             }
+            int64_t submit_front_us = 0;
+            int64_t record_tail_us = 0;
+            int64_t vk_submit_us = 0;
+            size_t n_graph_calls = 0;
+            size_t n_vk_submits = 0;
+            uint64_t submit_gap_ns = 0;
+            size_t n_submit_gaps = 0;
+            if (!ops->continuous_submit_profile(
+                        split_backend,
+                        &submit_front_us,
+                        &record_tail_us,
+                        &vk_submit_us,
+                        &n_graph_calls,
+                        &n_vk_submits,
+                        &submit_gap_ns,
+                        &n_submit_gaps)) {
+                GGML_LOG_ERROR("%s: failed to read continuous Stream MoE submit timings\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+            sched->moe_stream_submit_front_us += submit_front_us;
+            sched->moe_stream_record_tail_us += record_tail_us;
+            sched->moe_stream_vk_submit_us += vk_submit_us;
+            sched->moe_stream_graph_call_count += (int64_t) n_graph_calls;
+            sched->moe_stream_vk_submit_count += (int64_t) n_vk_submits;
+            sched->moe_stream_submit_gap_ns += (int64_t) submit_gap_ns;
+            sched->moe_stream_submit_gap_count += (int64_t) n_submit_gaps;
+
+            uint64_t window_gap_ns = 0;
+            size_t n_window_gaps = 0;
+            if (!ops->continuous_window_gaps(split_backend, &window_gap_ns, &n_window_gaps)) {
+                GGML_LOG_ERROR("%s: failed to read continuous Stream MoE window timings\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+            sched->moe_stream_window_gap_ns += (int64_t) window_gap_ns;
+            sched->moe_stream_window_gap_count += (int64_t) n_window_gaps;
         } else if (!sched->callback_eval || sched->moe_stream_continuous) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2039,15 +2106,72 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 void ggml_backend_sched_set_moe_stream_continuous(
         ggml_backend_sched_t sched,
         bool enabled,
-        int max_plans) {
+        int max_plans,
+        int rolling_lookahead) {
     GGML_ASSERT(sched);
     sched->moe_stream_continuous = enabled;
     sched->moe_stream_continuous_max_plans = enabled ? std::max(max_plans, 1) : 0;
+    sched->moe_stream_rolling_lookahead = enabled ? std::max(rolling_lookahead, 0) : 0;
 }
 
 int64_t ggml_backend_sched_get_last_moe_stream_hit_plans(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->moe_stream_hit_plans;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_resume_submit_us(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_resume_submit_us;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_resume_count(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_resume_count;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_submit_front_us(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_submit_front_us;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_record_tail_us(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_record_tail_us;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_vk_submit_us(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_vk_submit_us;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_graph_call_count(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_graph_call_count;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_vk_submit_count(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_vk_submit_count;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_submit_gap_ns(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_submit_gap_ns;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_submit_gap_count(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_submit_gap_count;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_window_gap_ns(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_window_gap_ns;
+}
+
+int64_t ggml_backend_sched_get_last_moe_stream_window_gap_count(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->moe_stream_window_gap_count;
 }
 
 int64_t ggml_backend_sched_get_last_eval_callback_sync_us(ggml_backend_sched_t sched) {

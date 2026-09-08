@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -1858,6 +1859,9 @@ struct vk_context_struct {
     std::vector<vk_staging_memset> memsets;
 
     vk_command_pool * p {};
+    ggml_backend_vk_context * backend_ctx {};
+    int32_t submit_gap_query_end = -1;
+    bool moe_stream_group_conditional_active {};
 };
 typedef std::shared_ptr<vk_context_struct> vk_context;
 typedef std::weak_ptr<vk_context_struct> vk_context_ref;
@@ -2116,6 +2120,16 @@ struct vk_moe_stream_cache_layer_state {
     vk_buffer use_counter;
 };
 
+struct vk_moe_stream_rolling_submission {
+    vk_context context;
+    size_t plan_index = SIZE_MAX;
+};
+
+struct vk_moe_stream_rolling_replay_submission {
+    std::vector<vk::CommandBuffer> command_buffers;
+    size_t plan_index = SIZE_MAX;
+};
+
 struct vk_moe_stream_cache_state {
     std::vector<vk_moe_stream_cache_layer_state> layers;
 
@@ -2127,6 +2141,7 @@ struct vk_moe_stream_cache_state {
     vk_buffer mapped_topk;
     vk_buffer plan_meta;
     vk_buffer plan_meta_readback;
+    vk_buffer rolling_plan_meta_readback;
 
     std::vector<ggml_backend_moe_stream_cache_load> host_loads;
     std::vector<int32_t> host_required_slots;
@@ -2146,12 +2161,64 @@ struct vk_moe_stream_cache_state {
     bool continuous_recording {};
     bool pending_continuous_plan {};
     int32_t continuous_miss_layer = -1;
+    uint64_t continuous_skip_tail_ns {};
     int32_t continuous_capture_layer = -1;
     size_t continuous_resume_plan = 0;
+    uint32_t continuous_window_index {};
+    uint32_t continuous_window_count {};
+    bool continuous_submit_profile_active {};
+    int64_t continuous_graph_start_us {};
+    int64_t continuous_first_submit_end_us {};
+    int64_t continuous_submit_front_us {};
+    int64_t continuous_record_tail_us {};
+    int64_t continuous_vk_submit_us {};
+    size_t continuous_graph_calls {};
+    size_t continuous_vk_submit_calls {};
+    uint32_t continuous_submit_gap_query_next {};
+    bool continuous_submit_gap_pending {};
+    uint64_t continuous_submit_gap_ns {};
+    size_t continuous_submit_gap_count {};
     std::vector<std::pair<int32_t, int64_t>> continuous_planner_calls;
     std::vector<std::pair<vk_command_buffer *, int32_t>> continuous_commands;
+    int32_t rolling_lookahead {};
+    bool rolling_defer_submissions {};
+    bool rolling_replay_active {};
+    int32_t rolling_miss_layer = -1;
+    size_t rolling_miss_plan = SIZE_MAX;
+    size_t rolling_verified_plan {};
+    size_t rolling_last_submitted_plan = SIZE_MAX;
+    size_t rolling_command_cursor {};
+    std::vector<uint64_t> rolling_plan_signals;
+    std::vector<int32_t> rolling_plan_layers;
+    std::mutex rolling_mutex;
+    std::condition_variable rolling_cv;
+    std::vector<vk_moe_stream_rolling_submission> rolling_ready;
+    size_t rolling_ready_cursor {};
+    std::vector<vk_moe_stream_rolling_replay_submission> rolling_replay_ready;
+    size_t rolling_replay_cursor {};
+    bool rolling_recording_done {};
+    bool rolling_worker_failed {};
+    bool rolling_worker_pending_start {};
+    std::atomic<bool> rolling_stop_recording {};
+    bool rolling_recording_incomplete {};
+    bool rolling_continuation_recording {};
+    bool rolling_continuation_guarded {};
+    bool rolling_remaining_guarded {};
+    struct ggml_cgraph rolling_remaining_graph {};
+    size_t rolling_carried_hit_plans {};
+    uint64_t rolling_accumulated_flops {};
+    bool rolling_initial_miss_observed {};
+    std::thread rolling_worker;
 
     ~vk_moe_stream_cache_state() {
+        if (rolling_worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(rolling_mutex);
+                rolling_recording_done = true;
+            }
+            rolling_cv.notify_all();
+            rolling_worker.join();
+        }
         for (auto & layer : layers) {
             ggml_vk_destroy_buffer(layer.expert_map);
             ggml_vk_destroy_buffer(layer.available_map);
@@ -2167,6 +2234,7 @@ struct vk_moe_stream_cache_state {
         ggml_vk_destroy_buffer(mapped_topk);
         ggml_vk_destroy_buffer(plan_meta);
         ggml_vk_destroy_buffer(plan_meta_readback);
+        ggml_vk_destroy_buffer(rolling_plan_meta_readback);
     }
 };
 
@@ -2188,6 +2256,7 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    bool moe_stream_group_conditional {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -2242,6 +2311,14 @@ struct ggml_backend_vk_context {
     vk_moe_stream_cache_state moe_stream_cache;
     vk::QueryPool moe_stream_query_pool;
     vk::QueryPool moe_stream_commit_query_pool;
+    vk::QueryPool moe_stream_continuous_query_pool;
+    uint32_t moe_stream_continuous_query_count {};
+    vk::QueryPool moe_stream_window_query_pool;
+    uint32_t moe_stream_window_query_count {};
+    vk::QueryPool moe_stream_submit_gap_query_pool;
+    uint32_t moe_stream_submit_gap_query_count {};
+    vk::Semaphore moe_stream_rolling_semaphore;
+    uint64_t moe_stream_rolling_semaphore_value {};
     vk::QueryPool query_pool;
     std::vector<const char *> query_fusion_names;
     std::vector<int> query_fusion_node_count;
@@ -3020,8 +3097,25 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
-    std::lock_guard<std::mutex> guard(queue_mutex);
-    ctx->p->q->queue.submit(submit_infos, fence);
+    auto * backend_ctx = ctx->backend_ctx;
+    const bool profile_submit = backend_ctx != nullptr &&
+            !ctx->p->q->transfer_only &&
+            backend_ctx->moe_stream_cache.continuous_submit_profile_active;
+    const int64_t submit_start_us = profile_submit ? ggml_time_us() : 0;
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->p->q->queue.submit(submit_infos, fence);
+    }
+    if (profile_submit) {
+        auto & cache = backend_ctx->moe_stream_cache;
+        const int64_t submit_end_us = ggml_time_us();
+        cache.continuous_vk_submit_us += submit_end_us - submit_start_us;
+        cache.continuous_vk_submit_calls++;
+        if (cache.continuous_first_submit_end_us == 0) {
+            cache.continuous_first_submit_end_us = submit_end_us;
+            cache.continuous_submit_front_us += submit_end_us - cache.continuous_graph_start_us;
+        }
+    }
 
     ctx->seqs.clear();
 }
@@ -3091,6 +3185,7 @@ static vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_comma
     VK_LOG_DEBUG("ggml_vk_create_context(" << result << ")");
     ctx->gc.contexts.emplace_back(result);
     result->p = &p;
+    result->backend_ctx = ctx;
     return result;
 }
 
@@ -7771,6 +7866,22 @@ static void ggml_vk_ctx_end(vk_context& ctx) {
         return;
     }
 
+    if (ctx->moe_stream_group_conditional_active) {
+        auto * backend_ctx = ctx->backend_ctx;
+        GGML_ASSERT(backend_ctx != nullptr);
+        backend_ctx->device->pfn_vkCmdEndConditionalRenderingEXT(ctx->s->buffer->buf);
+        ctx->moe_stream_group_conditional_active = false;
+    }
+
+    if (ctx->submit_gap_query_end >= 0) {
+        auto * backend_ctx = ctx->backend_ctx;
+        GGML_ASSERT(backend_ctx != nullptr);
+        ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands,
+                backend_ctx->moe_stream_submit_gap_query_pool,
+                (uint32_t) ctx->submit_gap_query_end);
+        ctx->submit_gap_query_end = -1;
+    }
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -7783,6 +7894,23 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx, bool one_ti
 
     subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, one_time) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
+    subctx->submit_gap_query_end = -1;
+    subctx->moe_stream_group_conditional_active = false;
+    auto * backend_ctx = subctx->backend_ctx;
+    if (backend_ctx != nullptr && !subctx->p->q->transfer_only &&
+            backend_ctx->moe_stream_cache.continuous_submit_profile_active &&
+            backend_ctx->moe_stream_cache.rolling_lookahead == 0) {
+        auto & cache = backend_ctx->moe_stream_cache;
+        GGML_ASSERT(backend_ctx->moe_stream_submit_gap_query_pool != nullptr);
+        GGML_ASSERT(cache.continuous_submit_gap_query_next + 2 <=
+                backend_ctx->moe_stream_submit_gap_query_count);
+        const uint32_t start_query = cache.continuous_submit_gap_query_next++;
+        subctx->submit_gap_query_end = (int32_t) cache.continuous_submit_gap_query_next++;
+        subctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands,
+                backend_ctx->moe_stream_submit_gap_query_pool,
+                start_query);
+    }
 }
 
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
@@ -14786,7 +14914,14 @@ static bool ggml_vk_build_graph(
         }
     }
 
-    const bool conditional = conditional_execution || ggml_vk_moe_stream_conditional_gemm(ctx, node);
+    const bool grouped_conditional = conditional_execution && ctx->moe_stream_group_conditional;
+    if (grouped_conditional && !compute_ctx->moe_stream_group_conditional_active) {
+        ggml_vk_moe_stream_begin_conditional(ctx, compute_ctx);
+        compute_ctx->moe_stream_group_conditional_active = true;
+    }
+
+    const bool conditional = !grouped_conditional &&
+            (conditional_execution || ggml_vk_moe_stream_conditional_gemm(ctx, node));
     if (conditional) {
         ggml_vk_moe_stream_begin_conditional(ctx, compute_ctx);
     }
@@ -15151,11 +15286,29 @@ static bool ggml_vk_build_graph(
         if (conditional) {
             ggml_vk_moe_stream_end_conditional(ctx, compute_ctx);
         }
+        if (grouped_conditional && compute_ctx->moe_stream_group_conditional_active) {
+            ggml_vk_moe_stream_end_conditional(ctx, compute_ctx);
+            compute_ctx->moe_stream_group_conditional_active = false;
+        }
         return false;
     }
 
     if (conditional) {
         ggml_vk_moe_stream_end_conditional(ctx, compute_ctx);
+    }
+
+    if (ctx->moe_stream_cache.continuous_recording && last_node) {
+        GGML_ASSERT(ctx->moe_stream_continuous_query_pool != nullptr);
+        GGML_ASSERT(ctx->moe_stream_continuous_query_count > 0);
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands,
+                ctx->moe_stream_continuous_query_pool,
+                ctx->moe_stream_continuous_query_count - 1);
+        GGML_ASSERT(ctx->moe_stream_window_query_pool != nullptr);
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands,
+                ctx->moe_stream_window_query_pool,
+                2 * ctx->moe_stream_cache.continuous_window_index + 1);
     }
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
@@ -15184,6 +15337,395 @@ static bool ggml_vk_build_graph(
     return true;
 }
 
+static bool ggml_vk_moe_stream_rolling_read_plan(
+        ggml_backend_vk_context * ctx, size_t plan_index, bool * hit) {
+    auto & cache = ctx->moe_stream_cache;
+    if (hit == nullptr || cache.rolling_lookahead <= 0 ||
+            plan_index >= cache.rolling_plan_signals.size() ||
+            plan_index >= cache.rolling_plan_layers.size() ||
+            cache.rolling_plan_signals[plan_index] == 0 ||
+            cache.rolling_plan_meta_readback == nullptr) {
+        return false;
+    }
+
+    const auto * meta = (const int32_t *) ((const uint8_t *) cache.rolling_plan_meta_readback->ptr +
+            plan_index * VK_MOE_STREAM_META_BUFFER_SIZE);
+    const int32_t expected_layer = cache.rolling_plan_layers[plan_index];
+    if (expected_layer < 0) {
+        return false;
+    }
+    if (meta[7] != expected_layer) {
+        GGML_LOG_ERROR("%s: rolling plan %zu reported layer %d, expected %d\n",
+                __func__, plan_index, meta[7], expected_layer);
+        return false;
+    }
+
+    *hit = meta[6] != 0;
+    if (!*hit) {
+        memcpy(cache.plan_meta_readback->ptr, meta, VK_MOE_STREAM_META_BUFFER_SIZE);
+        cache.rolling_defer_submissions = true;
+        cache.rolling_miss_layer = expected_layer;
+        cache.rolling_miss_plan = plan_index;
+    }
+    cache.rolling_verified_plan = plan_index + 1;
+    return true;
+}
+
+static bool ggml_vk_moe_stream_rolling_wait_plan(
+        ggml_backend_vk_context * ctx, size_t plan_index, bool * hit) {
+    auto & cache = ctx->moe_stream_cache;
+    if (plan_index >= cache.rolling_plan_signals.size() ||
+            cache.rolling_plan_signals[plan_index] == 0) {
+        return false;
+    }
+    const vk::Semaphore semaphore = ctx->moe_stream_rolling_semaphore;
+    const uint64_t value = cache.rolling_plan_signals[plan_index];
+    vk::SemaphoreWaitInfo wait_info { vk::SemaphoreWaitFlags {}, semaphore, value };
+    VK_CHECK(ctx->device->device.waitSemaphores(wait_info, UINT64_MAX),
+            "wait for Stream MoE rolling plan");
+    return ggml_vk_moe_stream_rolling_read_plan(ctx, plan_index, hit);
+}
+
+static bool ggml_vk_moe_stream_rolling_submit_contexts(
+        ggml_backend_vk_context * ctx,
+        std::vector<vk_moe_stream_rolling_submission> & ready) {
+    auto & cache = ctx->moe_stream_cache;
+    if (ready.empty()) {
+        return false;
+    }
+    vk_context submit_ctx = ready.front().context;
+    if (submit_ctx == nullptr || submit_ctx->seqs.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < ready.size(); ++i) {
+        auto & item = ready[i];
+        if (item.context == nullptr || item.context->seqs.empty() ||
+                item.context->p != submit_ctx->p) {
+            return false;
+        }
+        if (item.plan_index != SIZE_MAX) {
+            if (item.plan_index >= cache.rolling_plan_signals.size()) {
+                return false;
+            }
+            const uint64_t signal_value = ++ctx->moe_stream_rolling_semaphore_value;
+            item.context->seqs.back().back().signal_semaphores.push_back(
+                    { ctx->moe_stream_rolling_semaphore, signal_value });
+            cache.rolling_plan_signals[item.plan_index] = signal_value;
+            cache.rolling_last_submitted_plan = item.plan_index;
+        }
+        if (i > 0) {
+            for (auto & sequence : item.context->seqs) {
+                submit_ctx->seqs.emplace_back(std::move(sequence));
+            }
+            item.context->seqs.clear();
+        }
+    }
+    ggml_vk_submit(submit_ctx, {});
+    ctx->submit_pending = true;
+    return true;
+}
+
+static bool ggml_vk_moe_stream_rolling_submit_replay(
+        ggml_backend_vk_context * ctx,
+        const vk_moe_stream_rolling_replay_submission & ready) {
+    auto & cache = ctx->moe_stream_cache;
+    if (ready.command_buffers.empty()) {
+        return false;
+    }
+
+    vk::SubmitInfo submit_info;
+    submit_info.commandBufferCount = (uint32_t) ready.command_buffers.size();
+    submit_info.pCommandBuffers = ready.command_buffers.data();
+    vk::TimelineSemaphoreSubmitInfo timeline_info;
+    vk::Semaphore signal_semaphore;
+    uint64_t signal_value = 0;
+    if (ready.plan_index != SIZE_MAX) {
+        if (ready.plan_index >= cache.rolling_plan_signals.size()) {
+            return false;
+        }
+        signal_semaphore = ctx->moe_stream_rolling_semaphore;
+        signal_value = ++ctx->moe_stream_rolling_semaphore_value;
+        timeline_info.signalSemaphoreValueCount = 1;
+        timeline_info.pSignalSemaphoreValues = &signal_value;
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = &signal_semaphore;
+        submit_info.setPNext(&timeline_info);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({ submit_info }, {});
+    }
+    ctx->submit_pending = true;
+    if (ready.plan_index != SIZE_MAX) {
+        cache.rolling_plan_signals[ready.plan_index] = signal_value;
+        cache.rolling_last_submitted_plan = ready.plan_index;
+    }
+    return true;
+}
+
+static void ggml_vk_moe_stream_rolling_worker(ggml_backend_vk_context * ctx) {
+    auto & cache = ctx->moe_stream_cache;
+    std::deque<size_t> inflight;
+
+    const auto record_initial_miss = [&cache] {
+        std::lock_guard<std::mutex> lock(cache.rolling_mutex);
+        if (!cache.rolling_initial_miss_observed) {
+            cache.rolling_initial_miss_observed = true;
+            cache.rolling_stop_recording.store(true, std::memory_order_release);
+        }
+    };
+
+    for (;;) {
+        while (!cache.rolling_defer_submissions &&
+                inflight.size() < (size_t) cache.rolling_lookahead) {
+            vk_moe_stream_rolling_replay_submission replay;
+            std::vector<vk_moe_stream_rolling_submission> ready_batch;
+            {
+                std::lock_guard<std::mutex> lock(cache.rolling_mutex);
+                if (cache.rolling_replay_cursor < cache.rolling_replay_ready.size()) {
+                    replay = cache.rolling_replay_ready[cache.rolling_replay_cursor++];
+                } else {
+                    size_t plan_budget = (size_t) cache.rolling_lookahead - inflight.size();
+                    while (cache.rolling_ready_cursor < cache.rolling_ready.size() && plan_budget > 0) {
+                        auto item = cache.rolling_ready[cache.rolling_ready_cursor++];
+                        if (item.plan_index != SIZE_MAX) {
+                            --plan_budget;
+                        }
+                        ready_batch.push_back(std::move(item));
+                    }
+                }
+            }
+
+            if (!replay.command_buffers.empty()) {
+                if (!ggml_vk_moe_stream_rolling_submit_replay(ctx, replay)) {
+                    cache.rolling_worker_failed = true;
+                    break;
+                }
+                if (replay.plan_index != SIZE_MAX) {
+                    inflight.push_back(replay.plan_index);
+                }
+                continue;
+            }
+            if (!ready_batch.empty()) {
+                if (!ggml_vk_moe_stream_rolling_submit_contexts(ctx, ready_batch)) {
+                    cache.rolling_worker_failed = true;
+                    break;
+                }
+                for (const auto & item : ready_batch) {
+                    if (item.plan_index != SIZE_MAX) {
+                        inflight.push_back(item.plan_index);
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+        if (cache.rolling_worker_failed || cache.rolling_defer_submissions) {
+            break;
+        }
+
+        if (!inflight.empty()) {
+            bool hit = false;
+            const size_t completed_plan = inflight.front();
+            if (!ggml_vk_moe_stream_rolling_wait_plan(ctx, completed_plan, &hit)) {
+                cache.rolling_worker_failed = true;
+                break;
+            }
+            inflight.pop_front();
+            if (!hit) {
+                record_initial_miss();
+                break;
+            }
+            uint64_t completed_value = 0;
+            VK_CHECK(ctx->device->device.getSemaphoreCounterValue(
+                    ctx->moe_stream_rolling_semaphore, &completed_value),
+                    "read Stream MoE rolling timeline");
+            bool missed = false;
+            while (!inflight.empty()) {
+                const size_t plan_index = inflight.front();
+                if (plan_index >= cache.rolling_plan_signals.size() ||
+                        cache.rolling_plan_signals[plan_index] == 0 ||
+                        cache.rolling_plan_signals[plan_index] > completed_value) {
+                    break;
+                }
+                if (!ggml_vk_moe_stream_rolling_read_plan(ctx, plan_index, &hit)) {
+                    cache.rolling_worker_failed = true;
+                    missed = true;
+                    break;
+                }
+                inflight.pop_front();
+                if (!hit) {
+                    record_initial_miss();
+                    missed = true;
+                    break;
+                }
+            }
+            if (missed) {
+                break;
+            }
+            continue;
+        }
+
+        std::unique_lock<std::mutex> lock(cache.rolling_mutex);
+        if (cache.rolling_recording_done &&
+                cache.rolling_replay_cursor >= cache.rolling_replay_ready.size() &&
+                cache.rolling_ready_cursor >= cache.rolling_ready.size()) {
+            break;
+        }
+        cache.rolling_cv.wait(lock, [&cache] {
+            return cache.rolling_defer_submissions ||
+                    cache.rolling_replay_cursor < cache.rolling_replay_ready.size() ||
+                    cache.rolling_ready_cursor < cache.rolling_ready.size() ||
+                    cache.rolling_recording_done;
+        });
+    }
+}
+
+static size_t ggml_vk_moe_stream_rolling_find_plan(
+        const vk_moe_stream_cache_state & cache, int32_t layer_id, size_t begin) {
+    for (size_t i = begin; i < cache.continuous_planner_calls.size(); ++i) {
+        if (cache.continuous_planner_calls[i].first == layer_id) {
+            return i;
+        }
+    }
+    return cache.continuous_planner_calls.size();
+}
+
+static bool ggml_vk_moe_stream_prepare_rolling_replay(
+        vk_moe_stream_cache_state & cache, size_t command_begin, size_t plan_begin) {
+    cache.rolling_replay_ready.clear();
+    cache.rolling_replay_cursor = 0;
+
+    size_t command_cursor = command_begin;
+    while (command_cursor < cache.continuous_commands.size()) {
+        size_t command_end = cache.continuous_commands.size();
+        size_t plan_index = SIZE_MAX;
+        for (size_t i = command_cursor; i < cache.continuous_commands.size(); ++i) {
+            const int32_t layer_id = cache.continuous_commands[i].second;
+            if (layer_id >= 0) {
+                command_end = i + 1;
+                plan_index = ggml_vk_moe_stream_rolling_find_plan(cache, layer_id, plan_begin);
+                if (plan_index == cache.continuous_planner_calls.size()) {
+                    return false;
+                }
+                break;
+            }
+        }
+        if (plan_index != SIZE_MAX && plan_index + 1 == cache.continuous_planner_calls.size()) {
+            command_end = cache.continuous_commands.size();
+        }
+
+        vk_moe_stream_rolling_replay_submission ready;
+        ready.plan_index = plan_index;
+        ready.command_buffers.reserve(command_end - command_cursor);
+        for (size_t i = command_cursor; i < command_end; ++i) {
+            ready.command_buffers.push_back(cache.continuous_commands[i].first->buf);
+        }
+        if (ready.command_buffers.empty()) {
+            return false;
+        }
+        cache.rolling_replay_ready.push_back(std::move(ready));
+        command_cursor = command_end;
+        if (plan_index != SIZE_MAX) {
+            plan_begin = plan_index + 1;
+        }
+    }
+    return true;
+}
+
+static bool ggml_vk_moe_stream_rolling_submit_next(ggml_backend_vk_context * ctx) {
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.rolling_command_cursor >= cache.continuous_commands.size()) {
+        return true;
+    }
+
+    size_t command_end = cache.continuous_commands.size();
+    size_t plan_index = cache.continuous_planner_calls.size();
+    for (size_t i = cache.rolling_command_cursor; i < cache.continuous_commands.size(); ++i) {
+        const int32_t layer_id = cache.continuous_commands[i].second;
+        if (layer_id >= 0) {
+            command_end = i + 1;
+            plan_index = ggml_vk_moe_stream_rolling_find_plan(
+                    cache, layer_id, cache.rolling_verified_plan);
+            break;
+        }
+    }
+    if (plan_index < cache.continuous_planner_calls.size() &&
+            plan_index + 1 == cache.continuous_planner_calls.size()) {
+        command_end = cache.continuous_commands.size();
+    }
+
+    std::vector<vk::CommandBuffer> command_buffers;
+    command_buffers.reserve(command_end - cache.rolling_command_cursor);
+    for (size_t i = cache.rolling_command_cursor; i < command_end; ++i) {
+        command_buffers.push_back(cache.continuous_commands[i].first->buf);
+    }
+    if (command_buffers.empty()) {
+        return false;
+    }
+
+    vk::SubmitInfo submit_info;
+    submit_info.commandBufferCount = (uint32_t) command_buffers.size();
+    submit_info.pCommandBuffers = command_buffers.data();
+    vk::TimelineSemaphoreSubmitInfo timeline_info;
+    vk::Semaphore signal_semaphore;
+    uint64_t signal_value = 0;
+    if (plan_index < cache.continuous_planner_calls.size()) {
+        signal_semaphore = ctx->moe_stream_rolling_semaphore;
+        signal_value = ++ctx->moe_stream_rolling_semaphore_value;
+        timeline_info.signalSemaphoreValueCount = 1;
+        timeline_info.pSignalSemaphoreValues = &signal_value;
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = &signal_semaphore;
+        submit_info.setPNext(&timeline_info);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({ submit_info }, {});
+    }
+    ctx->submit_pending = true;
+    cache.rolling_command_cursor = command_end;
+    if (plan_index < cache.continuous_planner_calls.size()) {
+        cache.rolling_plan_signals[plan_index] = signal_value;
+        cache.rolling_last_submitted_plan = plan_index;
+    }
+    return true;
+}
+
+static bool ggml_vk_moe_stream_rolling_replay(ggml_backend_vk_context * ctx) {
+    auto & cache = ctx->moe_stream_cache;
+    while (!cache.rolling_defer_submissions) {
+        while (cache.rolling_command_cursor < cache.continuous_commands.size() &&
+                (cache.rolling_last_submitted_plan == SIZE_MAX ||
+                 cache.rolling_last_submitted_plan + 1 - cache.rolling_verified_plan <
+                         (size_t) cache.rolling_lookahead)) {
+            if (!ggml_vk_moe_stream_rolling_submit_next(ctx)) {
+                return false;
+            }
+        }
+
+        if (cache.rolling_last_submitted_plan != SIZE_MAX &&
+                cache.rolling_verified_plan <= cache.rolling_last_submitted_plan) {
+            bool hit = false;
+            if (!ggml_vk_moe_stream_rolling_wait_plan(ctx, cache.rolling_verified_plan, &hit)) {
+                return false;
+            }
+            if (!hit) {
+                break;
+            }
+            continue;
+        }
+
+        if (cache.rolling_command_cursor >= cache.continuous_commands.size()) {
+            break;
+        }
+        return false;
+    }
+    return true;
+}
+
 static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, ggml_tensor * tensor, int tensor_idx, bool almost_ready = false) {
     GGML_UNUSED(cgraph);
     GGML_UNUSED(tensor);
@@ -15198,6 +15740,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         ggml_vk_check_results_0(ctx, cgraph, tensor_idx);
 #endif
 
+        size_t rolling_plan = SIZE_MAX;
         if (ctx->moe_stream_cache.continuous_recording) {
             const size_t first = ctx->moe_stream_cache.continuous_commands.size();
             for (const auto & sequence : subctx->seqs) {
@@ -15209,6 +15752,12 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
                 GGML_ASSERT(ctx->moe_stream_cache.continuous_commands.size() > first);
                 ctx->moe_stream_cache.continuous_commands.back().second =
                         ctx->moe_stream_cache.continuous_capture_layer;
+                if (ctx->moe_stream_cache.rolling_lookahead > 0) {
+                    GGML_ASSERT(!ctx->moe_stream_cache.continuous_planner_calls.empty());
+                    rolling_plan = ctx->moe_stream_cache.continuous_planner_calls.size() - 1;
+                    ctx->moe_stream_cache.rolling_plan_layers[rolling_plan] =
+                            ctx->moe_stream_cache.continuous_capture_layer;
+                }
             }
         }
 
@@ -15221,13 +15770,23 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
-        if (almost_ready && !ctx->almost_ready_fence_pending) {
-            ggml_vk_submit(subctx, ctx->almost_ready_fence);
-            ctx->almost_ready_fence_pending = true;
+        const bool rolling = ctx->moe_stream_cache.continuous_recording &&
+                ctx->moe_stream_cache.rolling_lookahead > 0;
+        if (rolling) {
+            {
+                std::lock_guard<std::mutex> lock(ctx->moe_stream_cache.rolling_mutex);
+                ctx->moe_stream_cache.rolling_ready.push_back({ subctx, rolling_plan });
+            }
+            ctx->moe_stream_cache.rolling_cv.notify_one();
         } else {
-            ggml_vk_submit(subctx, {});
+            if (almost_ready && !ctx->almost_ready_fence_pending) {
+                ggml_vk_submit(subctx, ctx->almost_ready_fence);
+                ctx->almost_ready_fence_pending = true;
+            } else {
+                ggml_vk_submit(subctx, {});
+            }
+            ctx->submit_pending = true;
         }
-        ctx->submit_pending = true;
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_synchronize(ctx);
@@ -15323,6 +15882,26 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     if (ctx->moe_stream_commit_query_pool) {
         ctx->device->device.destroyQueryPool(ctx->moe_stream_commit_query_pool);
         ctx->moe_stream_commit_query_pool = nullptr;
+    }
+    if (ctx->moe_stream_continuous_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->moe_stream_continuous_query_pool);
+        ctx->moe_stream_continuous_query_pool = nullptr;
+        ctx->moe_stream_continuous_query_count = 0;
+    }
+    if (ctx->moe_stream_window_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->moe_stream_window_query_pool);
+        ctx->moe_stream_window_query_pool = nullptr;
+        ctx->moe_stream_window_query_count = 0;
+    }
+    if (ctx->moe_stream_submit_gap_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->moe_stream_submit_gap_query_pool);
+        ctx->moe_stream_submit_gap_query_pool = nullptr;
+        ctx->moe_stream_submit_gap_query_count = 0;
+    }
+    if (ctx->moe_stream_rolling_semaphore) {
+        ctx->device->device.destroySemaphore(ctx->moe_stream_rolling_semaphore);
+        ctx->moe_stream_rolling_semaphore = nullptr;
+        ctx->moe_stream_rolling_semaphore_value = 0;
     }
 
     for (auto& pool : ctx->descriptor_pools) {
@@ -16431,6 +17010,33 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    auto & moe_stream_cache = ctx->moe_stream_cache;
+    const bool moe_stream_continuous = moe_stream_cache.continuous_recording;
+    const bool moe_stream_rolling_continuation = moe_stream_continuous &&
+            moe_stream_cache.rolling_continuation_recording;
+    if (moe_stream_continuous) {
+        GGML_ASSERT(!moe_stream_cache.continuous_submit_profile_active);
+        moe_stream_cache.continuous_submit_profile_active = true;
+        moe_stream_cache.continuous_graph_start_us = ggml_time_us();
+        moe_stream_cache.continuous_first_submit_end_us = 0;
+        const size_t submit_gap_query_count = 2 * ((size_t) cgraph->n_nodes + 16);
+        GGML_ASSERT(submit_gap_query_count <= UINT32_MAX);
+        if (!ctx->moe_stream_submit_gap_query_pool ||
+                ctx->moe_stream_submit_gap_query_count < submit_gap_query_count) {
+            if (ctx->moe_stream_submit_gap_query_pool) {
+                ctx->device->device.destroyQueryPool(ctx->moe_stream_submit_gap_query_pool);
+            }
+            vk::QueryPoolCreateInfo query_create_info;
+            query_create_info.queryType = vk::QueryType::eTimestamp;
+            query_create_info.queryCount = (uint32_t) submit_gap_query_count;
+            ctx->moe_stream_submit_gap_query_pool = ctx->device->device.createQueryPool(query_create_info);
+            ctx->moe_stream_submit_gap_query_count = query_create_info.queryCount;
+        }
+        ctx->device->device.resetQueryPool(
+                ctx->moe_stream_submit_gap_query_pool, 0, ctx->moe_stream_submit_gap_query_count);
+        moe_stream_cache.continuous_submit_gap_query_next = 0;
+        moe_stream_cache.continuous_submit_gap_pending = false;
+    }
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -16493,6 +17099,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
 
+    if (moe_stream_continuous && !moe_stream_rolling_continuation) {
+        GGML_ASSERT(ctx->moe_stream_window_query_pool != nullptr);
+        compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands,
+                ctx->moe_stream_window_query_pool,
+                2 * ctx->moe_stream_cache.continuous_window_index);
+    }
+
     if (ctx->prealloc_size_add_rms_partials) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -16501,8 +17116,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
-    const bool moe_stream_continuous = ctx->moe_stream_cache.continuous_recording;
-    bool moe_stream_guarded = false;
+    if (moe_stream_continuous && moe_stream_cache.rolling_worker_pending_start) {
+        GGML_ASSERT(moe_stream_cache.rolling_lookahead > 0);
+        GGML_ASSERT(!moe_stream_cache.rolling_worker.joinable());
+        moe_stream_cache.rolling_worker_pending_start = false;
+        moe_stream_cache.rolling_worker = std::thread(ggml_vk_moe_stream_rolling_worker, ctx);
+    }
+
+    bool moe_stream_guarded = moe_stream_rolling_continuation &&
+            moe_stream_cache.rolling_continuation_guarded;
     if (!moe_stream_continuous && cgraph->nodes[last_node]->op == GGML_OP_MOE_STREAM_CACHE_DECIDE) {
         if (!ctx->moe_stream_query_pool) {
             vk::QueryPoolCreateInfo query_create_info;
@@ -16749,7 +17371,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending) ||
+                      (almost_ready && !ctx->almost_ready_fence_pending &&
+                       moe_stream_cache.rolling_lookahead == 0) ||
                       (moe_stream_continuous && moe_stream_decision);
 
         ctx->moe_stream_cache.continuous_capture_layer =
@@ -16800,12 +17423,38 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             submit_count++;
         }
+        const int next_node = i + ctx->num_additional_fused_ops + 1;
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
+        if (!vk_perf_logger_enabled && moe_stream_continuous &&
+                moe_stream_cache.rolling_lookahead > 0 && submit && enqueued &&
+                next_node < cgraph->n_nodes &&
+                moe_stream_cache.rolling_stop_recording.load(std::memory_order_acquire)) {
+            auto & remaining = moe_stream_cache.rolling_remaining_graph;
+            remaining = *cgraph;
+            remaining.size = 0;
+            remaining.n_nodes = cgraph->n_nodes - next_node;
+            remaining.n_leafs = 0;
+            remaining.nodes = cgraph->nodes + next_node;
+            remaining.grads = nullptr;
+            remaining.grad_accs = nullptr;
+            remaining.leafs = nullptr;
+            remaining.uid = 0;
+            moe_stream_cache.rolling_recording_incomplete = true;
+            moe_stream_cache.rolling_remaining_guarded = moe_stream_guarded;
+            break;
+        }
     }
 
-    ctx->last_total_flops = total_flops;
+    if (moe_stream_continuous && moe_stream_cache.rolling_lookahead > 0) {
+        moe_stream_cache.rolling_accumulated_flops += total_flops;
+        if (!moe_stream_cache.rolling_recording_incomplete) {
+            ctx->last_total_flops = moe_stream_cache.rolling_accumulated_flops;
+        }
+    } else {
+        ctx->last_total_flops = total_flops;
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -16852,6 +17501,30 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
+    }
+
+    if (moe_stream_continuous) {
+        const int64_t graph_end_us = ggml_time_us();
+        if (moe_stream_cache.rolling_lookahead > 0) {
+            {
+                std::lock_guard<std::mutex> lock(moe_stream_cache.rolling_mutex);
+                moe_stream_cache.rolling_recording_done = true;
+            }
+            moe_stream_cache.rolling_cv.notify_all();
+            moe_stream_cache.rolling_worker.join();
+        }
+        if (moe_stream_cache.continuous_first_submit_end_us == 0 ||
+                moe_stream_cache.continuous_first_submit_end_us >= graph_end_us) {
+            moe_stream_cache.continuous_submit_front_us +=
+                    graph_end_us - moe_stream_cache.continuous_graph_start_us;
+        } else {
+            moe_stream_cache.continuous_record_tail_us +=
+                    graph_end_us - moe_stream_cache.continuous_first_submit_end_us;
+        }
+        moe_stream_cache.continuous_graph_calls++;
+        moe_stream_cache.continuous_submit_profile_active = false;
+        moe_stream_cache.continuous_submit_gap_pending =
+                moe_stream_cache.continuous_submit_gap_query_next >= 2;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -17198,6 +17871,12 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
+    ctx->moe_stream_group_conditional =
+            ctx->device->conditional_rendering &&
+            std::getenv("LLAMA_MOE_STREAM_GROUP_CONDITIONAL") != nullptr;
+    if (ctx->moe_stream_group_conditional) {
+        GGML_LOG_INFO("ggml_vulkan: Stream MoE grouped conditional regions enabled\n");
+    }
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),
@@ -18187,9 +18866,12 @@ static void ggml_vk_moe_stream_alloc_readback(vk_device & device, vk_buffer & bu
 }
 
 static void ggml_vk_moe_stream_copy_meta(
-        vk_context & compute_ctx, const vk_moe_stream_cache_state & cache) {
+        vk_context & compute_ctx,
+        const vk_moe_stream_cache_state & cache,
+        size_t rolling_plan = SIZE_MAX) {
     GGML_ASSERT(cache.plan_meta != nullptr);
     GGML_ASSERT(cache.plan_meta_readback != nullptr);
+    GGML_ASSERT(rolling_plan == SIZE_MAX || cache.rolling_plan_meta_readback != nullptr);
 
     compute_ctx->s->buffer->buf.pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader,
@@ -18201,6 +18883,14 @@ static void ggml_vk_moe_stream_copy_meta(
             cache.plan_meta->buffer,
             cache.plan_meta_readback->buffer,
             { { 0, 0, VK_MOE_STREAM_META_COUNT * sizeof(int32_t) } });
+    if (rolling_plan != SIZE_MAX) {
+        compute_ctx->s->buffer->buf.copyBuffer(
+                cache.plan_meta->buffer,
+                cache.rolling_plan_meta_readback->buffer,
+                { { 0,
+                    rolling_plan * VK_MOE_STREAM_META_BUFFER_SIZE,
+                    VK_MOE_STREAM_META_BUFFER_SIZE } });
+    }
     compute_ctx->s->buffer->buf.pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
             vk::PipelineStageFlagBits::eHost,
@@ -18422,7 +19112,9 @@ static bool ggml_vk_moe_stream_cache_decide(
     }
 
     ++cache.n_calls;
+    size_t continuous_query_index = cache.layers.size();
     if (cache.continuous_recording) {
+        continuous_query_index = cache.continuous_planner_calls.size() + 1;
         cache.continuous_planner_calls.emplace_back(layer_id, cache.n_calls);
     }
     const bool decay = cache.hot_decay_interval > 0 &&
@@ -18488,8 +19180,18 @@ static bool ggml_vk_moe_stream_cache_decide(
         ggml_vk_moe_stream_buffer_info(cache.plan_meta),
         ggml_vk_moe_stream_buffer_info(layer.use_counter),
     }, pc, { 1, 1, 1 });
-    ggml_vk_moe_stream_copy_meta(compute_ctx, cache);
-    if (!cache.continuous_recording) {
+    ggml_vk_moe_stream_copy_meta(
+            compute_ctx,
+            cache,
+            cache.rolling_lookahead > 0 ? cache.continuous_planner_calls.size() - 1 : SIZE_MAX);
+    if (cache.continuous_recording) {
+        GGML_ASSERT(ctx->moe_stream_continuous_query_pool != nullptr);
+        GGML_ASSERT(continuous_query_index + 1 < ctx->moe_stream_continuous_query_count);
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands,
+                ctx->moe_stream_continuous_query_pool,
+                (uint32_t) continuous_query_index);
+    } else {
         compute_ctx->s->buffer->buf.writeTimestamp(
                 vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 2);
     }
@@ -18557,6 +19259,7 @@ static bool ggml_backend_vk_prepare_moe_stream_cache(
     memcpy(meta, cache.plan_meta_readback->ptr, sizeof(meta));
     plan->t_gpu_segment_ns = 0;
     plan->t_gpu_planner_ns = 0;
+    plan->t_gpu_skip_tail_ns = continuous_plan ? cache.continuous_skip_tail_ns : 0;
     plan->t_gpu_commit_carry_ns = 0;
     plan->n_gpu_commit_carry = 0;
     if (graph_prepared && cache.commit_timing_pending) {
@@ -18725,24 +19428,162 @@ static bool ggml_backend_vk_moe_stream_supports_continuous(ggml_backend_t backen
             ((ggml_backend_vk_context *) backend->context)->device->conditional_rendering;
 }
 
-static bool ggml_backend_vk_moe_stream_continuous_begin(ggml_backend_t backend, bool resume) {
+static bool ggml_vk_moe_stream_begin_recording_chunk(
+        ggml_backend_vk_context * ctx, bool continuation) {
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.rolling_worker.joinable()) {
+        return false;
+    }
+
+    cache.continuous_recording = true;
+    cache.continuous_skip_tail_ns = 0;
+    cache.continuous_capture_layer = -1;
+    cache.continuous_resume_plan = 0;
+    cache.continuous_planner_calls.clear();
+    cache.continuous_commands.clear();
+    cache.rolling_defer_submissions = false;
+    cache.rolling_replay_active = false;
+    cache.rolling_miss_layer = -1;
+    cache.rolling_miss_plan = SIZE_MAX;
+    cache.rolling_verified_plan = 0;
+    cache.rolling_last_submitted_plan = SIZE_MAX;
+    cache.rolling_command_cursor = 0;
+    cache.rolling_plan_signals.assign(cache.layers.size(), 0);
+    cache.rolling_plan_layers.assign(cache.layers.size(), -1);
+    cache.rolling_ready.clear();
+    cache.rolling_ready_cursor = 0;
+    cache.rolling_replay_ready.clear();
+    cache.rolling_replay_cursor = 0;
+    cache.rolling_recording_done = false;
+    cache.rolling_worker_failed = false;
+    cache.rolling_worker_pending_start = false;
+    cache.rolling_stop_recording.store(false, std::memory_order_release);
+    cache.rolling_recording_incomplete = false;
+    cache.rolling_continuation_recording = continuation;
+    cache.rolling_continuation_guarded = false;
+    cache.rolling_remaining_guarded = false;
+    cache.rolling_remaining_graph = {};
+    cache.rolling_initial_miss_observed = false;
+
+    if (cache.rolling_lookahead > 0) {
+        ggml_vk_moe_stream_alloc_readback(
+                ctx->device,
+                cache.rolling_plan_meta_readback,
+                cache.layers.size() * VK_MOE_STREAM_META_BUFFER_SIZE);
+        memset(cache.rolling_plan_meta_readback->ptr, 0xff,
+                cache.layers.size() * VK_MOE_STREAM_META_BUFFER_SIZE);
+        if (!ctx->moe_stream_rolling_semaphore) {
+            vk::SemaphoreTypeCreateInfo type_info{ vk::SemaphoreType::eTimeline, 0 };
+            vk::SemaphoreCreateInfo create_info {};
+            create_info.setPNext(&type_info);
+            ctx->moe_stream_rolling_semaphore = ctx->device->device.createSemaphore(create_info);
+            ctx->moe_stream_rolling_semaphore_value = 0;
+        }
+        cache.rolling_worker_pending_start = true;
+    }
+    return true;
+}
+
+static bool ggml_vk_moe_stream_begin_rolling_continuation(
+        ggml_backend_vk_context * ctx) {
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.rolling_worker.joinable() || cache.rolling_lookahead <= 0 ||
+            (cache.rolling_replay_ready.empty() && cache.rolling_remaining_graph.n_nodes <= 0)) {
+        return false;
+    }
+
+    cache.continuous_recording = true;
+    cache.continuous_skip_tail_ns = 0;
+    cache.continuous_capture_layer = -1;
+    cache.rolling_defer_submissions = false;
+    cache.rolling_miss_layer = -1;
+    cache.rolling_miss_plan = SIZE_MAX;
+    cache.rolling_last_submitted_plan = SIZE_MAX;
+    cache.rolling_ready.clear();
+    cache.rolling_ready_cursor = 0;
+    cache.rolling_replay_cursor = 0;
+    cache.rolling_recording_done = false;
+    cache.rolling_worker_failed = false;
+    cache.rolling_worker_pending_start = true;
+    cache.rolling_stop_recording.store(false, std::memory_order_release);
+    cache.rolling_recording_incomplete = false;
+    cache.rolling_continuation_recording = true;
+    cache.rolling_continuation_guarded = cache.rolling_remaining_guarded;
+    cache.rolling_remaining_guarded = false;
+    cache.rolling_initial_miss_observed = false;
+    if (!cache.continuous_planner_calls.empty()) {
+        cache.n_calls = cache.continuous_planner_calls.back().second;
+    }
+    return true;
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_begin(
+        ggml_backend_t backend, bool sequence_continuation, int32_t rolling_lookahead) {
     if (!ggml_backend_is_vk(backend)) {
         return false;
     }
     auto * ctx = (ggml_backend_vk_context *) backend->context;
     auto & cache = ctx->moe_stream_cache;
-    if (resume || !ctx->device->conditional_rendering || cache.plan_meta == nullptr ||
+    if (!ctx->device->conditional_rendering || cache.plan_meta == nullptr ||
             cache.plan_meta_readback == nullptr || cache.plan_pending ||
-            cache.pending_continuous_plan || cache.continuous_active) {
+            cache.pending_continuous_plan || cache.continuous_active || rolling_lookahead < 0) {
         return false;
     }
+    if (cache.rolling_worker.joinable()) {
+        return false;
+    }
+    const size_t query_count = cache.layers.size() + 2;
+    const size_t window_query_count = 2 * cache.layers.size();
+    if (query_count > UINT32_MAX || window_query_count > UINT32_MAX || window_query_count == 0) {
+        return false;
+    }
+    if (!ctx->moe_stream_continuous_query_pool ||
+            ctx->moe_stream_continuous_query_count < query_count) {
+        if (ctx->moe_stream_continuous_query_pool) {
+            ctx->device->device.destroyQueryPool(ctx->moe_stream_continuous_query_pool);
+        }
+        vk::QueryPoolCreateInfo query_create_info;
+        query_create_info.queryType = vk::QueryType::eTimestamp;
+        query_create_info.queryCount = (uint32_t) query_count;
+        ctx->moe_stream_continuous_query_pool = ctx->device->device.createQueryPool(query_create_info);
+        ctx->moe_stream_continuous_query_count = query_create_info.queryCount;
+    }
+    if (!ctx->moe_stream_window_query_pool ||
+            ctx->moe_stream_window_query_count < window_query_count) {
+        if (ctx->moe_stream_window_query_pool) {
+            ctx->device->device.destroyQueryPool(ctx->moe_stream_window_query_pool);
+        }
+        vk::QueryPoolCreateInfo query_create_info;
+        query_create_info.queryType = vk::QueryType::eTimestamp;
+        query_create_info.queryCount = (uint32_t) window_query_count;
+        ctx->moe_stream_window_query_pool = ctx->device->device.createQueryPool(query_create_info);
+        ctx->moe_stream_window_query_count = query_create_info.queryCount;
+    }
+    ctx->device->device.resetQueryPool(
+            ctx->moe_stream_continuous_query_pool, 0, ctx->moe_stream_continuous_query_count);
+    if (!sequence_continuation) {
+        ctx->device->device.resetQueryPool(
+                ctx->moe_stream_window_query_pool, 0, ctx->moe_stream_window_query_count);
+        cache.continuous_window_count = 0;
+        cache.continuous_submit_front_us = 0;
+        cache.continuous_record_tail_us = 0;
+        cache.continuous_vk_submit_us = 0;
+        cache.continuous_graph_calls = 0;
+        cache.continuous_vk_submit_calls = 0;
+        cache.continuous_submit_gap_ns = 0;
+        cache.continuous_submit_gap_count = 0;
+    } else if (cache.continuous_window_count == 0) {
+        return false;
+    }
+    if (cache.continuous_window_count >= cache.layers.size()) {
+        return false;
+    }
+    cache.continuous_window_index = cache.continuous_window_count++;
     cache.continuous_active = true;
-    cache.continuous_recording = true;
-    cache.continuous_capture_layer = -1;
-    cache.continuous_resume_plan = 0;
-    cache.continuous_planner_calls.clear();
-    cache.continuous_commands.clear();
-    return true;
+    cache.rolling_lookahead = rolling_lookahead;
+    cache.rolling_carried_hit_plans = 0;
+    cache.rolling_accumulated_flops = 0;
+    return ggml_vk_moe_stream_begin_recording_chunk(ctx, false);
 }
 
 static bool ggml_backend_vk_moe_stream_continuous_wait(ggml_backend_t backend) {
@@ -18753,8 +19594,58 @@ static bool ggml_backend_vk_moe_stream_continuous_wait(ggml_backend_t backend) {
     if (!ctx->moe_stream_cache.continuous_active) {
         return false;
     }
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.rolling_worker.joinable()) {
+        cache.rolling_cv.notify_all();
+        cache.rolling_worker.join();
+    }
+    if (cache.rolling_worker_failed) {
+        return false;
+    }
+    const bool rolling_replay = cache.rolling_lookahead > 0 && cache.rolling_replay_active;
+    if (rolling_replay) {
+        if (cache.rolling_recording_incomplete) {
+            struct ggml_cgraph remaining = cache.rolling_remaining_graph;
+            if (remaining.n_nodes <= 0 || remaining.nodes == nullptr ||
+                    !ggml_vk_moe_stream_begin_rolling_continuation(ctx)) {
+                return false;
+            }
+            cache.rolling_remaining_graph = {};
+            if (ggml_backend_vk_graph_compute(backend, &remaining) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+        } else if (!ggml_vk_moe_stream_rolling_replay(ctx)) {
+            return false;
+        }
+    }
     ggml_vk_synchronize(ctx);
-    ctx->moe_stream_cache.continuous_recording = false;
+    if (cache.continuous_submit_gap_pending && cache.rolling_lookahead == 0) {
+        std::vector<uint64_t> timestamps(cache.continuous_submit_gap_query_next);
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->moe_stream_submit_gap_query_pool,
+                0,
+                cache.continuous_submit_gap_query_next,
+                timestamps.size() * sizeof(uint64_t),
+                timestamps.data(),
+                sizeof(uint64_t),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "get Stream MoE submit gap timestamps");
+        const double timestamp_period = ctx->device->properties.limits.timestampPeriod;
+        const size_t n_command_buffers = timestamps.size() / 2;
+        for (size_t i = 1; i < n_command_buffers; ++i) {
+            const uint64_t previous_end = timestamps[2 * i - 1];
+            const uint64_t current_start = timestamps[2 * i];
+            if (current_start >= previous_end) {
+                cache.continuous_submit_gap_ns +=
+                        (uint64_t) ((current_start - previous_end) * timestamp_period);
+                cache.continuous_submit_gap_count++;
+            }
+        }
+        cache.continuous_submit_gap_pending = false;
+    }
+    cache.continuous_submit_gap_pending = false;
+    cache.continuous_recording = false;
+    cache.rolling_replay_active = false;
     return true;
 }
 
@@ -18788,6 +19679,19 @@ static bool ggml_backend_vk_moe_stream_continuous_resume(ggml_backend_t backend,
         return false;
     }
     cache.continuous_resume_plan = plan_index + 1;
+    cache.continuous_skip_tail_ns = 0;
+    ctx->device->device.resetQueryPool(
+            ctx->moe_stream_continuous_query_pool, 0, ctx->moe_stream_continuous_query_count);
+    ctx->device->device.resetQueryPool(
+            ctx->moe_stream_window_query_pool,
+            2 * cache.continuous_window_index + 1,
+            1);
+    if (ctx->moe_stream_submit_gap_query_pool && cache.continuous_submit_gap_query_next > 0) {
+        ctx->device->device.resetQueryPool(
+                ctx->moe_stream_submit_gap_query_pool,
+                0,
+                cache.continuous_submit_gap_query_next);
+    }
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
@@ -18801,6 +19705,27 @@ static bool ggml_backend_vk_moe_stream_continuous_resume(ggml_backend_t backend,
         ggml_vk_submit(compute_ctx, {});
         ctx->compute_ctx.reset();
         ctx->submit_pending = true;
+    }
+
+    if (cache.rolling_lookahead > 0) {
+        cache.rolling_defer_submissions = false;
+        cache.rolling_replay_active = true;
+        cache.rolling_miss_layer = -1;
+        cache.rolling_miss_plan = SIZE_MAX;
+        cache.rolling_verified_plan = plan_index + 1;
+        cache.rolling_last_submitted_plan = SIZE_MAX;
+        cache.rolling_command_cursor = command_index + 1;
+        std::fill(cache.rolling_plan_signals.begin(), cache.rolling_plan_signals.end(), 0);
+        if (cache.rolling_recording_incomplete) {
+            if (!ggml_vk_moe_stream_prepare_rolling_replay(
+                        cache, command_index + 1, plan_index + 1)) {
+                return false;
+            }
+        } else {
+            cache.rolling_replay_ready.clear();
+            cache.rolling_replay_cursor = 0;
+        }
+        return true;
     }
 
     std::vector<vk::CommandBuffer> command_buffers;
@@ -18834,8 +19759,66 @@ static bool ggml_backend_vk_moe_stream_continuous_status(
 
     *miss_layer = -1;
     *n_hit_plans = 0;
+    cache.continuous_skip_tail_ns = 0;
     if (cache.continuous_resume_plan >= cache.continuous_planner_calls.size()) {
+        *n_hit_plans = cache.rolling_carried_hit_plans;
+        cache.rolling_carried_hit_plans = 0;
         return true;
+    }
+    if (cache.rolling_lookahead > 0) {
+        if (cache.rolling_miss_layer == INT32_MIN) {
+            return false;
+        }
+        if (cache.rolling_miss_layer >= 0) {
+            const size_t plan_index = cache.rolling_miss_plan;
+            if (plan_index < cache.continuous_resume_plan ||
+                    plan_index >= cache.continuous_planner_calls.size() ||
+                    cache.continuous_planner_calls[plan_index].first != cache.rolling_miss_layer) {
+                return false;
+            }
+            if (cache.rolling_last_submitted_plan != SIZE_MAX &&
+                    cache.rolling_last_submitted_plan >= plan_index) {
+                uint64_t miss_timestamp = 0;
+                uint64_t end_timestamp = 0;
+                uint32_t end_query = (uint32_t) cache.rolling_last_submitted_plan + 1;
+                if (cache.rolling_last_submitted_plan + 1 ==
+                        cache.continuous_planner_calls.size() &&
+                        cache.rolling_command_cursor == cache.continuous_commands.size() &&
+                        !cache.rolling_recording_incomplete) {
+                    end_query = ctx->moe_stream_continuous_query_count - 1;
+                }
+                VK_CHECK(ctx->device->device.getQueryPoolResults(
+                        ctx->moe_stream_continuous_query_pool,
+                        (uint32_t) plan_index + 1,
+                        1,
+                        sizeof(miss_timestamp),
+                        &miss_timestamp,
+                        sizeof(miss_timestamp),
+                        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                        "get Stream MoE rolling miss timestamp");
+                VK_CHECK(ctx->device->device.getQueryPoolResults(
+                        ctx->moe_stream_continuous_query_pool,
+                        end_query,
+                        1,
+                        sizeof(end_timestamp),
+                        &end_timestamp,
+                        sizeof(end_timestamp),
+                        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                        "get Stream MoE rolling tail timestamp");
+                if (end_timestamp >= miss_timestamp) {
+                    cache.continuous_skip_tail_ns = (uint64_t) ((end_timestamp - miss_timestamp) *
+                            ctx->device->properties.limits.timestampPeriod);
+                }
+            }
+            cache.n_calls = cache.continuous_planner_calls[plan_index].second;
+            *miss_layer = cache.rolling_miss_layer;
+            *n_hit_plans = cache.rolling_carried_hit_plans +
+                    plan_index - cache.continuous_resume_plan;
+            cache.rolling_carried_hit_plans = 0;
+            cache.pending_continuous_plan = true;
+            cache.continuous_miss_layer = cache.rolling_miss_layer;
+            return true;
+        }
     }
 
     int32_t meta[VK_MOE_STREAM_META_COUNT] = {};
@@ -18858,13 +19841,41 @@ static bool ggml_backend_vk_moe_stream_continuous_status(
         if (plan_index + 1 != cache.continuous_planner_calls.size()) {
             return false;
         }
-        *n_hit_plans = cache.continuous_planner_calls.size() - cache.continuous_resume_plan;
+        *n_hit_plans = cache.rolling_carried_hit_plans +
+                cache.continuous_planner_calls.size() - cache.continuous_resume_plan;
+        cache.rolling_carried_hit_plans = 0;
         cache.n_calls = cache.continuous_planner_calls.back().second;
         cache.continuous_resume_plan = cache.continuous_planner_calls.size();
     } else {
+        uint64_t miss_timestamp = 0;
+        uint64_t end_timestamp = 0;
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->moe_stream_continuous_query_pool,
+                (uint32_t) plan_index + 1,
+                1,
+                sizeof(miss_timestamp),
+                &miss_timestamp,
+                sizeof(miss_timestamp),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "get Stream MoE miss timestamp");
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->moe_stream_continuous_query_pool,
+                ctx->moe_stream_continuous_query_count - 1,
+                1,
+                sizeof(end_timestamp),
+                &end_timestamp,
+                sizeof(end_timestamp),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "get Stream MoE window-end timestamp");
+        if (end_timestamp >= miss_timestamp) {
+            cache.continuous_skip_tail_ns = (uint64_t) ((end_timestamp - miss_timestamp) *
+                    ctx->device->properties.limits.timestampPeriod);
+        }
         cache.n_calls = cache.continuous_planner_calls[plan_index].second;
         *miss_layer = layer_id;
-        *n_hit_plans = plan_index - cache.continuous_resume_plan;
+        *n_hit_plans = cache.rolling_carried_hit_plans +
+                plan_index - cache.continuous_resume_plan;
+        cache.rolling_carried_hit_plans = 0;
         cache.pending_continuous_plan = true;
         cache.continuous_miss_layer = layer_id;
     }
@@ -18880,16 +19891,121 @@ static void ggml_backend_vk_moe_stream_continuous_end(ggml_backend_t backend) {
     if (!cache.continuous_active) {
         return;
     }
+    if (cache.rolling_worker.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(cache.rolling_mutex);
+            cache.rolling_recording_done = true;
+        }
+        cache.rolling_cv.notify_all();
+        cache.rolling_worker.join();
+    }
     ggml_vk_synchronize(ctx);
     cache.continuous_active = false;
     cache.continuous_recording = false;
     cache.pending_continuous_plan = false;
     cache.continuous_miss_layer = -1;
+    cache.continuous_skip_tail_ns = 0;
     cache.continuous_capture_layer = -1;
     cache.continuous_resume_plan = 0;
     cache.continuous_planner_calls.clear();
     cache.continuous_commands.clear();
+    cache.rolling_lookahead = 0;
+    cache.rolling_defer_submissions = false;
+    cache.rolling_replay_active = false;
+    cache.rolling_miss_layer = -1;
+    cache.rolling_miss_plan = SIZE_MAX;
+    cache.rolling_verified_plan = 0;
+    cache.rolling_last_submitted_plan = SIZE_MAX;
+    cache.rolling_command_cursor = 0;
+    cache.rolling_plan_signals.clear();
+    cache.rolling_plan_layers.clear();
+    cache.rolling_ready.clear();
+    cache.rolling_ready_cursor = 0;
+    cache.rolling_replay_ready.clear();
+    cache.rolling_replay_cursor = 0;
+    cache.rolling_recording_done = false;
+    cache.rolling_worker_failed = false;
+    cache.rolling_worker_pending_start = false;
+    cache.rolling_stop_recording.store(false, std::memory_order_release);
+    cache.rolling_recording_incomplete = false;
+    cache.rolling_continuation_recording = false;
+    cache.rolling_continuation_guarded = false;
+    cache.rolling_remaining_guarded = false;
+    cache.rolling_remaining_graph = {};
+    cache.rolling_carried_hit_plans = 0;
+    cache.rolling_accumulated_flops = 0;
     ggml_vk_graph_cleanup(ctx);
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_window_gaps(
+        ggml_backend_t backend, uint64_t * time_ns, size_t * n_gaps) {
+    if (!ggml_backend_is_vk(backend) || time_ns == nullptr || n_gaps == nullptr) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.continuous_active || !ctx->moe_stream_window_query_pool) {
+        return false;
+    }
+
+    *time_ns = 0;
+    *n_gaps = 0;
+    if (cache.continuous_window_count < 2) {
+        return true;
+    }
+
+    std::vector<uint64_t> timestamps(2 * cache.continuous_window_count);
+    VK_CHECK(ctx->device->device.getQueryPoolResults(
+            ctx->moe_stream_window_query_pool,
+            0,
+            (uint32_t) timestamps.size(),
+            timestamps.size() * sizeof(uint64_t),
+            timestamps.data(),
+            sizeof(uint64_t),
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+            "get Stream MoE window timestamps");
+
+    const double timestamp_period = ctx->device->properties.limits.timestampPeriod;
+    for (uint32_t i = 1; i < cache.continuous_window_count; ++i) {
+        const uint64_t previous_end = timestamps[2 * i - 1];
+        const uint64_t current_start = timestamps[2 * i];
+        if (current_start < previous_end) {
+            return false;
+        }
+        *time_ns += (uint64_t) ((current_start - previous_end) * timestamp_period);
+        (*n_gaps)++;
+    }
+    return true;
+}
+
+static bool ggml_backend_vk_moe_stream_continuous_submit_profile(
+        ggml_backend_t backend,
+        int64_t * submit_front_us,
+        int64_t * record_tail_us,
+        int64_t * vk_submit_us,
+        size_t * graph_calls,
+        size_t * vk_submit_calls,
+        uint64_t * submit_gap_ns,
+        size_t * submit_gap_count) {
+    if (!ggml_backend_is_vk(backend) || submit_front_us == nullptr || record_tail_us == nullptr ||
+            vk_submit_us == nullptr || graph_calls == nullptr || vk_submit_calls == nullptr ||
+            submit_gap_ns == nullptr || submit_gap_count == nullptr ||
+            submit_gap_count == nullptr) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & cache = ctx->moe_stream_cache;
+    if (cache.continuous_active || cache.continuous_submit_profile_active) {
+        return false;
+    }
+    *submit_front_us = cache.continuous_submit_front_us;
+    *record_tail_us = cache.continuous_record_tail_us;
+    *vk_submit_us = cache.continuous_vk_submit_us;
+    *graph_calls = cache.continuous_graph_calls;
+    *vk_submit_calls = cache.continuous_vk_submit_calls;
+    *submit_gap_ns = cache.continuous_submit_gap_ns;
+    *submit_gap_count = cache.continuous_submit_gap_count;
+    return true;
 }
 
 static const ggml_backend_moe_stream_cache_ops * ggml_backend_vk_get_moe_stream_cache_ops() {
@@ -18905,6 +20021,8 @@ static const ggml_backend_moe_stream_cache_ops * ggml_backend_vk_get_moe_stream_
         /* .continuous_resume = */ ggml_backend_vk_moe_stream_continuous_resume,
         /* .continuous_status = */ ggml_backend_vk_moe_stream_continuous_status,
         /* .continuous_end    = */ ggml_backend_vk_moe_stream_continuous_end,
+        /* .continuous_window_gaps = */ ggml_backend_vk_moe_stream_continuous_window_gaps,
+        /* .continuous_submit_profile = */ ggml_backend_vk_moe_stream_continuous_submit_profile,
     };
     return &ops;
 }
