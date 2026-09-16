@@ -240,11 +240,7 @@ extern "C" {
         size_t n_mapped_topk;
         const int32_t * next_map;
         size_t n_next_map;
-        uint64_t t_gpu_segment_ns;
-        uint64_t t_gpu_planner_ns;
         uint64_t t_gpu_skip_tail_ns;
-        uint64_t t_gpu_commit_carry_ns;
-        uint32_t n_gpu_commit_carry;
     };
 
     struct ggml_backend_moe_stream_cache_state {
@@ -288,7 +284,6 @@ extern "C" {
                 ggml_backend_t backend);
         bool (*continuous_begin)(
                 ggml_backend_t backend,
-                bool sequence_continuation,
                 int32_t rolling_lookahead);
         bool (*continuous_wait)(
                 ggml_backend_t backend);
@@ -301,19 +296,10 @@ extern "C" {
                 size_t * n_hit_plans);
         void (*continuous_end)(
                 ggml_backend_t backend);
-        bool (*continuous_window_gaps)(
-                ggml_backend_t backend,
-                uint64_t * time_ns,
-                size_t * n_gaps);
         bool (*continuous_submit_profile)(
                 ggml_backend_t backend,
-                int64_t * submit_front_us,
                 int64_t * record_tail_us,
-                int64_t * vk_submit_us,
                 size_t * graph_calls,
-                size_t * vk_submit_calls,
-                uint64_t * submit_gap_ns,
-                size_t * submit_gap_count,
                 int64_t * resume_submit_us,
                 size_t * resume_submit_count);
     };
@@ -452,21 +438,12 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_moe_stream_continuous(
             ggml_backend_sched_t sched,
             bool enabled,
-            int max_plans,
             int rolling_lookahead);
     GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_hit_plans(ggml_backend_sched_t sched);
     GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_resume_submit_us(ggml_backend_sched_t sched);
     GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_resume_count(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_submit_front_us(ggml_backend_sched_t sched);
     GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_record_tail_us(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_vk_submit_us(ggml_backend_sched_t sched);
     GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_graph_call_count(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_vk_submit_count(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_submit_gap_ns(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_submit_gap_count(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_window_gap_ns(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_moe_stream_window_gap_count(ggml_backend_sched_t sched);
-    GGML_API int64_t              ggml_backend_sched_get_last_eval_callback_sync_us(ggml_backend_sched_t sched);
     GGML_API int64_t              ggml_backend_sched_get_last_eval_callback_segment_us(ggml_backend_sched_t sched);
 
     //

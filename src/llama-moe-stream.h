@@ -81,14 +81,14 @@ struct llama_moe_stream_layer {
     // residency state, guarded by mgr->mtx
     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
     std::vector<uint8_t>                 slot_state;    // [n_slots] llama_moe_stream_slot_state
-    std::vector<uint8_t>                 slot_claimed;  // [n_slots] a worker owns the load
+    std::vector<uint8_t>                 slot_claimed;  // [n_slots] weight-slice tasks are queued or in flight
+    std::vector<uint16_t>                slot_parts_pending; // [n_slots] unfinished parallel weight slices
     std::vector<uint64_t>                slot_gen;      // [n_slots] reservation generation
     std::vector<int64_t>                 slot_last_use; // [n_slots] LRU stamps
     std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
     std::vector<int32_t>                 expert_map;    // [n_expert] committed RESIDENT mapping
 
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
-    std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
     int64_t use_counter = 0;
 
     ggml_backend_t shadow_backend = nullptr;
@@ -133,53 +133,26 @@ struct llama_moe_stream_work {
     int32_t  expert = -1;
     int32_t  slot   = -1;
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
-    int64_t  queued_us = 0;
+    int32_t  weight = -1; // -1 loads the full expert; otherwise one weight slice
 };
 
 struct llama_moe_stream_token_stats {
-    int64_t n_hit               = 0;
-    int64_t n_miss              = 0;
-    int64_t n_shadow_plans      = 0;
-    int64_t n_shadow_mismatches = 0;
-    int64_t n_gpu_hit_plans      = 0;
-    int64_t t_gpu_hit_segment_ns = 0;
-    int64_t t_gpu_hit_planner_ns = 0;
-    int64_t t_gpu_hit_wall_us    = 0;
-    int64_t t_gpu_hit_sync_us    = 0;
-    int64_t t_gpu_hit_cb_us      = 0;
-    int64_t t_gpu_hit_prepare_us = 0;
-    int64_t t_gpu_hit_commit_us  = 0;
+    int64_t n_hit                   = 0;
+    int64_t n_miss                  = 0;
     int64_t n_gpu_slow_plans      = 0;
-    int64_t n_gpu_slow_loads      = 0;
-    int64_t t_gpu_slow_segment_ns = 0;
-    int64_t t_gpu_slow_planner_ns = 0;
+    int64_t n_gpu_single_load_misses = 0;
+    int64_t t_gpu_single_load_us     = 0;
+    int64_t n_gpu_double_load_misses = 0;
+    int64_t t_gpu_double_load_us     = 0;
     int64_t t_gpu_slow_wall_us    = 0;
-    int64_t t_gpu_slow_sync_us    = 0;
     int64_t t_gpu_slow_cb_us      = 0;
-    int64_t t_gpu_slow_prepare_us = 0;
     int64_t t_gpu_slow_load_us    = 0;
-    int64_t t_gpu_slow_commit_us  = 0;
     int64_t n_gpu_slow_skip_tail  = 0;
     int64_t t_gpu_slow_skip_tail_ns = 0;
     int64_t n_gpu_slow_resume_submit = 0;
     int64_t t_gpu_slow_resume_submit_us = 0;
     int64_t n_gpu_submit_graph_calls = 0;
-    int64_t t_gpu_submit_front_us    = 0;
     int64_t t_gpu_record_tail_us     = 0;
-    int64_t n_gpu_vk_submits         = 0;
-    int64_t t_gpu_vk_submit_us       = 0;
-    int64_t n_gpu_submit_gaps        = 0;
-    int64_t t_gpu_submit_gap_ns      = 0;
-    int64_t n_gpu_window_gaps        = 0;
-    int64_t t_gpu_window_gap_ns      = 0;
-    int64_t n_gpu_slow_waiting     = 0;
-    int64_t t_gpu_slow_resident_wait_us = 0;
-    int64_t n_gpu_commit_carry     = 0;
-    int64_t t_gpu_commit_carry_ns  = 0;
-    int64_t n_worker_loads         = 0;
-    int64_t t_worker_queue_us      = 0;
-    int64_t t_worker_read_us       = 0;
-    int64_t t_worker_upload_us     = 0;
 };
 
 struct llama_moe_stream {
@@ -210,13 +183,7 @@ struct llama_moe_stream {
     void record_continuous_resume_submit(size_t n_resumes, int64_t time_us);
     void record_continuous_submit_profile(
             size_t n_graph_calls,
-            int64_t submit_front_us,
-            int64_t record_tail_us,
-            size_t n_vk_submits,
-            int64_t vk_submit_us,
-            size_t n_submit_gaps,
-            int64_t submit_gap_ns);
-    void record_continuous_window_gaps(size_t n_gaps, int64_t time_ns);
+            int64_t record_tail_us);
     bool eval_callback(
             ggml_backend_sched_t sched,
             ggml_tensor * tensor,
@@ -234,8 +201,13 @@ struct llama_moe_stream {
 
     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
     bool full_cache_test = false;
+    bool parallel_weight_load_requested = false;
+    bool parallel_weight_load = false;
 
     llama_files files; // privately reopened GGUF files, same indices as the loader's
+#ifdef _WIN32
+    std::vector<llama_files> worker_files; // independent seek positions for parallel Windows reads
+#endif
 
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
@@ -258,30 +230,17 @@ struct llama_moe_stream {
 
     bool debug = false;
     bool shadow = false;
+    bool profile = false;
     bool gpu_decode_requested = false;
     bool gpu_decode = false;
     bool gpu_decode_continuous_requested = false;
     bool gpu_decode_continuous = false;
-    int32_t gpu_decode_continuous_window = INT32_MAX;
     int32_t gpu_decode_rolling_lookahead = 0;
     bool gpu_decode_state_ready = false;
     bool gpu_decode_cpu_policy_stale = false;
 
     struct {
-        int64_t n_calls     = 0; // remap invocations
-        int64_t n_hit       = 0; // touched experts already resident or loading
-        int64_t n_miss      = 0; // demand loads issued
-        int64_t n_miss_cold = 0; // first-ever touch of an expert
-        int64_t t_stall_us  = 0; // wait time in miss handling
-
-        int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
-        int64_t n_waves_run      = 0; // non-empty waves
-        int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
-        int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
-        int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
-
-        int64_t n_shadow_plans      = 0;
-        int64_t n_shadow_mismatches = 0;
+        int64_t n_calls = 0;
     } stats;
 
     bool token_stats_active = false;
@@ -289,7 +248,9 @@ struct llama_moe_stream {
 
     // internals
     void start_workers_locked();
-    void worker_loop();
+    void worker_loop(int32_t worker_idx);
+    size_t queue_load_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    void notify_workers_locked(size_t n_tasks);
     void preload_full_cache();
     bool sync_decode_policy_locked();
     void count_token_stats_locked(const llama_moe_stream_layer & sl, const int32_t * ids, uint32_t n_ids, int64_t n_tokens);
@@ -301,8 +262,7 @@ struct llama_moe_stream {
             std::unique_lock<std::mutex> & lk,
             llama_moe_stream_layer & sl,
             size_t n_required = SIZE_MAX,
-            bool update_policy = true,
-            int64_t * resident_wait_us = nullptr);
+            bool update_policy = true);
     void commit_plan_locked(
             llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int64_t n);
 

@@ -399,49 +399,22 @@ private:
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
     struct {
-        int64_t n_hit               = 0;
-        int64_t n_miss              = 0;
-        int64_t n_shadow_plans      = 0;
-        int64_t n_shadow_mismatches = 0;
-        int64_t n_gpu_hit_plans      = 0;
-        int64_t t_gpu_hit_segment_ns = 0;
-        int64_t t_gpu_hit_planner_ns = 0;
-        int64_t t_gpu_hit_wall_us    = 0;
-        int64_t t_gpu_hit_sync_us    = 0;
-        int64_t t_gpu_hit_cb_us      = 0;
-        int64_t t_gpu_hit_prepare_us = 0;
-        int64_t t_gpu_hit_commit_us  = 0;
+        int64_t n_hit                   = 0;
+        int64_t n_miss                  = 0;
         int64_t n_gpu_slow_plans      = 0;
-        int64_t n_gpu_slow_loads      = 0;
-        int64_t t_gpu_slow_segment_ns = 0;
-        int64_t t_gpu_slow_planner_ns = 0;
+        int64_t n_gpu_single_load_misses = 0;
+        int64_t t_gpu_single_load_us     = 0;
+        int64_t n_gpu_double_load_misses = 0;
+        int64_t t_gpu_double_load_us     = 0;
         int64_t t_gpu_slow_wall_us    = 0;
-        int64_t t_gpu_slow_sync_us    = 0;
         int64_t t_gpu_slow_cb_us      = 0;
-        int64_t t_gpu_slow_prepare_us = 0;
         int64_t t_gpu_slow_load_us    = 0;
-        int64_t t_gpu_slow_commit_us  = 0;
         int64_t n_gpu_slow_skip_tail  = 0;
         int64_t t_gpu_slow_skip_tail_ns = 0;
         int64_t n_gpu_slow_resume_submit = 0;
         int64_t t_gpu_slow_resume_submit_us = 0;
         int64_t n_gpu_submit_graph_calls = 0;
-        int64_t t_gpu_submit_front_us    = 0;
         int64_t t_gpu_record_tail_us     = 0;
-        int64_t n_gpu_vk_submits         = 0;
-        int64_t t_gpu_vk_submit_us       = 0;
-        int64_t n_gpu_submit_gaps        = 0;
-        int64_t t_gpu_submit_gap_ns      = 0;
-        int64_t n_gpu_window_gaps        = 0;
-        int64_t t_gpu_window_gap_ns      = 0;
-        int64_t n_gpu_slow_waiting     = 0;
-        int64_t t_gpu_slow_resident_wait_us = 0;
-        int64_t n_gpu_commit_carry     = 0;
-        int64_t t_gpu_commit_carry_ns  = 0;
-        int64_t n_worker_loads         = 0;
-        int64_t t_worker_queue_us      = 0;
-        int64_t t_worker_read_us       = 0;
-        int64_t t_worker_upload_us     = 0;
     } moe_stats_prefill, moe_stats_decode;
 
     bool moe_stats_active = false;

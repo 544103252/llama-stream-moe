@@ -57,12 +57,17 @@ static void moe_aligned_free(void * p) {
 // read len bytes at file offset offs into staging (thread-safe positional read); staging must have
 // room for len (+ 2*MOE_STREAM_DIRECT_ALIGN when direct). returns a pointer to the len bytes
 // within staging, or nullptr on failure
-static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * staging, size_t len, size_t offs, bool direct) {
+static const uint8_t * llama_moe_stream_pread(
+        llama_file & file, uint8_t * staging, size_t len, size_t offs, bool direct, bool independent_file = false) {
 #ifdef _WIN32
     GGML_UNUSED(direct);
-    // no positional read primitive; serialize the seek+read pairs
+    // Shared handles need serialized seek+read pairs. Worker-private handles have independent
+    // file positions and can read concurrently.
     static std::mutex io_mtx;
-    std::lock_guard<std::mutex> lock(io_mtx);
+    std::unique_lock<std::mutex> lock(io_mtx, std::defer_lock);
+    if (!independent_file) {
+        lock.lock();
+    }
     try {
         file.seek(offs, SEEK_SET);
         file.read_raw(staging, len);
@@ -71,6 +76,7 @@ static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * stagi
         return nullptr;
     }
 #else
+    GGML_UNUSED(independent_file);
     const int fd = file.file_id();
 
     if (direct) {
@@ -146,20 +152,15 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
     shadow        = std::getenv("LLAMA_MOE_STREAM_SHADOW") != nullptr;
+    profile       = std::getenv("LLAMA_MOE_STREAM_PROFILE") != nullptr;
     gpu_decode_requested = std::getenv("LLAMA_MOE_STREAM_GPU_DECODE") != nullptr;
     gpu_decode_continuous_requested = std::getenv("LLAMA_MOE_STREAM_GPU_DECODE_CONTINUOUS") != nullptr;
     full_cache_test = std::getenv("LLAMA_MOE_STREAM_FULL_CACHE_TEST") != nullptr;
-    if (const char * value = std::getenv("LLAMA_MOE_STREAM_GPU_WINDOW")) {
-        const long parsed = std::strtol(value, nullptr, 10);
-        if (parsed > 0) {
-            gpu_decode_continuous_window = (int32_t) std::min<long>(parsed, INT32_MAX);
-        }
-    }
+    parallel_weight_load_requested = std::getenv("LLAMA_MOE_STREAM_VK_PARALLEL_LOAD") != nullptr;
     if (const char * value = std::getenv("LLAMA_MOE_STREAM_GPU_ROLLING")) {
         const long parsed = std::strtol(value, nullptr, 10);
         if (parsed > 0) {
             gpu_decode_rolling_lookahead = (int32_t) std::min<long>(parsed, INT32_MAX);
-            gpu_decode_continuous_window = INT32_MAX;
         }
     }
     use_direct_io = direct;
@@ -224,11 +225,11 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->slot_expert  .resize(n_slots, -1);
         sl->slot_state   .resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
         sl->slot_claimed .resize(n_slots, 0);
+        sl->slot_parts_pending.resize(n_slots, 0);
         sl->slot_gen     .resize(n_slots, 0);
         sl->slot_last_use.resize(n_slots, 0);
         sl->expert_map   .resize(n_expert, -1);
         sl->route_hotness.resize(n_expert, 0);
-        sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
     }
     GGML_ASSERT(sl->n_expert == n_expert);
@@ -264,6 +265,36 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
 
         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
                 __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
+    }
+
+    if (parallel_weight_load_requested && !no_alloc) {
+        bool found = false;
+        bool all_vulkan = true;
+        for (const auto & layer_ptr : layers) {
+            if (!layer_ptr) {
+                continue;
+            }
+            for (const auto & weight : layer_ptr->weights) {
+                found = true;
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight.cache->buffer);
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0) {
+                    all_vulkan = false;
+                    break;
+                }
+            }
+            if (!all_vulkan) {
+                break;
+            }
+        }
+        parallel_weight_load = found && all_vulkan && n_io_threads > 1;
+        if (parallel_weight_load) {
+            LLAMA_LOG_INFO("%s: Vulkan parallel expert weight loading enabled\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_STREAM_VK_PARALLEL_LOAD requested, but the cache is not Vulkan or has one I/O thread\n",
+                    __func__);
+        }
     }
 
     if (!shadow || no_alloc) {
@@ -375,11 +406,8 @@ void llama_moe_stream::bind_decode_backends(const std::vector<ggml_backend_t> & 
             if (gpu_decode_rolling_lookahead > 0) {
                 LLAMA_LOG_INFO("%s: Stream MoE rolling GPU decode enabled (lookahead=%d plans)\n",
                         __func__, gpu_decode_rolling_lookahead);
-            } else if (gpu_decode_continuous_window == INT32_MAX) {
-                LLAMA_LOG_INFO("%s: Stream MoE continuous GPU decode enabled (full graph)\n", __func__);
             } else {
-                LLAMA_LOG_INFO("%s: Stream MoE continuous GPU decode enabled (window=%d plans)\n",
-                        __func__, gpu_decode_continuous_window);
+                LLAMA_LOG_INFO("%s: Stream MoE continuous GPU decode enabled (full graph)\n", __func__);
             }
         } else if (gpu_decode_continuous_requested) {
             LLAMA_LOG_WARN("%s: continuous GPU decode requested, but the backend does not support it\n", __func__);
@@ -432,12 +460,7 @@ void llama_moe_stream::record_continuous_resume_submit(size_t n_resumes, int64_t
 
 void llama_moe_stream::record_continuous_submit_profile(
         size_t n_graph_calls,
-        int64_t submit_front_us,
-        int64_t record_tail_us,
-        size_t n_vk_submits,
-        int64_t vk_submit_us,
-        size_t n_submit_gaps,
-        int64_t submit_gap_ns) {
+        int64_t record_tail_us) {
     if (n_graph_calls == 0) {
         return;
     }
@@ -446,24 +469,7 @@ void llama_moe_stream::record_continuous_submit_profile(
         return;
     }
     token_stats.n_gpu_submit_graph_calls += (int64_t) n_graph_calls;
-    token_stats.t_gpu_submit_front_us += submit_front_us;
     token_stats.t_gpu_record_tail_us += record_tail_us;
-    token_stats.n_gpu_vk_submits += (int64_t) n_vk_submits;
-    token_stats.t_gpu_vk_submit_us += vk_submit_us;
-    token_stats.n_gpu_submit_gaps += (int64_t) n_submit_gaps;
-    token_stats.t_gpu_submit_gap_ns += submit_gap_ns;
-}
-
-void llama_moe_stream::record_continuous_window_gaps(size_t n_gaps, int64_t time_ns) {
-    if (n_gaps == 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(mtx);
-    if (!token_stats_active) {
-        return;
-    }
-    token_stats.n_gpu_window_gaps += (int64_t) n_gaps;
-    token_stats.t_gpu_window_gap_ns += time_ns;
 }
 
 bool llama_moe_stream::prepare_decode() {
@@ -591,6 +597,20 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         LLAMA_LOG_INFO("%s: MoE expert streaming uses O_DIRECT (page cache bypassed)\n", __func__);
     }
 
+#ifdef _WIN32
+    worker_files.clear();
+    if (parallel_weight_load) {
+        worker_files.resize(n_io_threads);
+        for (auto & worker_set : worker_files) {
+            worker_set.reserve(paths.size());
+            for (const auto & path : paths) {
+                worker_set.emplace_back(new llama_file(path.c_str(), "rb", false));
+            }
+        }
+        LLAMA_LOG_INFO("%s: opened independent GGUF handles for %d I/O workers\n", __func__, n_io_threads);
+    }
+#endif
+
     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
     //   64 * n_streamed_layers remap calls (computed once here, off the hot path)
     int64_t n_streamed = 0;
@@ -628,12 +648,12 @@ void llama_moe_stream::preload_full_cache() {
             continue;
         }
         auto & sl = *layer_ptr;
+        size_t n_tasks = 0;
         for (uint32_t expert = 0; expert < sl.n_expert; ++expert) {
             reserve_slot_locked(sl, (int32_t) expert, (int32_t) expert, false);
-            q_demand.push_back({ &sl, (int32_t) expert, (int32_t) expert,
-                    sl.slot_gen[expert], ggml_time_us() });
+            n_tasks += queue_load_locked(sl, (int32_t) expert, (int32_t) expert);
         }
-        cv_work.notify_all();
+        notify_workers_locked(n_tasks);
         cv_done.wait(lk, [&] {
             if (load_failed) {
                 return true;
@@ -666,17 +686,63 @@ void llama_moe_stream::start_workers_locked() {
     workers_started = true;
     workers.reserve(n_io_threads);
     for (int32_t i = 0; i < n_io_threads; i++) {
-        workers.emplace_back([this]() { worker_loop(); });
+        workers.emplace_back([this, i]() { worker_loop(i); });
+    }
+}
+
+size_t llama_moe_stream::queue_load_locked(
+        llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
+    GGML_ASSERT(slot >= 0 && (uint32_t) slot < sl.n_slots);
+    GGML_ASSERT(sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_LOADING);
+    GGML_ASSERT(sl.slot_expert[slot] == expert);
+
+    if (sl.slot_claimed[slot]) {
+        return 0;
+    }
+
+    sl.slot_claimed[slot] = 1;
+    const bool sliced = parallel_weight_load && sl.weights.size() > 1;
+    const size_t n_tasks = sliced ? sl.weights.size() : 1;
+    GGML_ASSERT(n_tasks <= UINT16_MAX);
+    sl.slot_parts_pending[slot] = (uint16_t) n_tasks;
+
+    if (sliced) {
+        for (size_t i = 0; i < sl.weights.size(); ++i) {
+            q_demand.push_back({ &sl, expert, slot, sl.slot_gen[slot], (int32_t) i });
+        }
+    } else {
+        q_demand.push_back({ &sl, expert, slot, sl.slot_gen[slot], -1 });
+    }
+
+    return n_tasks;
+}
+
+void llama_moe_stream::notify_workers_locked(size_t n_tasks) {
+    const size_t n_wake = std::min<size_t>(n_tasks, (size_t) n_io_threads);
+    for (size_t i = 0; i < n_wake; ++i) {
+        cv_work.notify_one();
     }
 }
 
 // I/O worker: pops a reserved load, reads its expert slab(s) from the GGUF file into the cache
 // slot, and marks the slot RESIDENT (or flags load_failed); stale/duplicate items are skipped
-void llama_moe_stream::worker_loop() {
+void llama_moe_stream::worker_loop(int32_t worker_idx) {
     // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
     uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
     GGML_ASSERT(staging != nullptr);
+
+    llama_files * read_files = &files;
+    bool independent_file = false;
+#ifdef _WIN32
+    if (parallel_weight_load) {
+        GGML_ASSERT(worker_idx >= 0 && (size_t) worker_idx < worker_files.size());
+        read_files = &worker_files[worker_idx];
+        independent_file = true;
+    }
+#else
+    GGML_UNUSED(worker_idx);
+#endif
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
@@ -692,47 +758,47 @@ void llama_moe_stream::worker_loop() {
         if (w.gen != sl.slot_gen[w.slot] ||
             sl.slot_state[w.slot] != LLAMA_MOE_STREAM_SLOT_LOADING ||
             sl.slot_expert[w.slot] != w.expert ||
-            sl.slot_claimed[w.slot]) {
-            continue; // stale or duplicate item
+            !sl.slot_claimed[w.slot] || sl.slot_parts_pending[w.slot] == 0 ||
+            (w.weight >= 0 && (size_t) w.weight >= sl.weights.size())) {
+            continue; // stale, duplicate, or completed item
         }
-        sl.slot_claimed[w.slot] = 1;
 
-        const int64_t queue_us = w.queued_us > 0 ? ggml_time_us() - w.queued_us : 0;
-        int64_t read_us = 0;
-        int64_t upload_us = 0;
+        const bool sliced = w.weight >= 0;
 
         lk.unlock();
 
         bool ok = true;
-        for (const auto & wt : sl.weights) {
-            const int64_t read_start_us = ggml_time_us();
-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
-            read_us += ggml_time_us() - read_start_us;
+        const size_t weight_begin = sliced ? (size_t) w.weight : 0;
+        const size_t weight_end = sliced ? weight_begin + 1 : sl.weights.size();
+        for (size_t i = weight_begin; i < weight_end; ++i) {
+            const auto & wt = sl.weights[i];
+            GGML_ASSERT((size_t) wt.file_idx < read_files->size());
+            const uint8_t * data = llama_moe_stream_pread(
+                    *(*read_files)[wt.file_idx], staging, wt.nb_expert,
+                    wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io, independent_file);
             if (data == nullptr) {
                 ok = false;
                 break;
             }
-            const int64_t upload_start_us = ggml_time_us();
             ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
-            upload_us += ggml_time_us() - upload_start_us;
         }
 
         lk.lock();
 
-        if (token_stats_active) {
-            token_stats.n_worker_loads++;
-            token_stats.t_worker_queue_us += queue_us;
-            token_stats.t_worker_read_us += read_us;
-            token_stats.t_worker_upload_us += upload_us;
-        }
-
-        sl.slot_claimed[w.slot] = 0;
         if (!ok) {
             load_failed = true;
-        } else {
+        }
+        GGML_ASSERT(sl.slot_parts_pending[w.slot] > 0);
+        sl.slot_parts_pending[w.slot]--;
+        if (sl.slot_parts_pending[w.slot] == 0) {
+            sl.slot_claimed[w.slot] = 0;
+        }
+        if (ok && !load_failed && sl.slot_parts_pending[w.slot] == 0) {
             sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
         }
-        cv_done.notify_all();
+        if (load_failed || sl.slot_parts_pending[w.slot] == 0) {
+            cv_done.notify_all();
+        }
     }
     lk.unlock();
 
@@ -778,12 +844,13 @@ void llama_moe_stream::reserve_slot_locked(
 
     sl.slot_expert[slot] = expert;
     sl.slot_state[slot]  = LLAMA_MOE_STREAM_SLOT_LOADING;
+    sl.slot_claimed[slot] = 0;
+    sl.slot_parts_pending[slot] = 0;
     sl.slot_gen[slot]++;
     if (update_policy) {
         sl.slot_last_use[slot] = ++sl.use_counter;
     }
     sl.expert_slot[expert] = slot;
-    sl.seen[expert] = 1;
 }
 
 void llama_moe_stream::refresh_expert_map_locked(llama_moe_stream_layer & sl) const {
@@ -876,12 +943,8 @@ void llama_moe_stream::apply_plan_locked(
         std::unique_lock<std::mutex> & lk,
         llama_moe_stream_layer & sl,
         size_t n_required,
-        bool update_policy,
-        int64_t * resident_wait_us) {
+        bool update_policy) {
     auto & plan = sl.plan;
-    if (resident_wait_us != nullptr) {
-        *resident_wait_us = 0;
-    }
     if (n_required == SIZE_MAX) {
         n_required = sl.uniq.size();
     }
@@ -892,30 +955,24 @@ void llama_moe_stream::apply_plan_locked(
         GGML_ASSERT(load.slot >= 0 && (uint32_t) load.slot < sl.n_slots);
         GGML_ASSERT(load.victim < 0 || sl.slot_expert[load.slot] == load.victim);
 
-        if (!sl.seen[load.expert]) {
-            stats.n_miss_cold++;
-        }
         reserve_slot_locked(sl, load.expert, load.slot, update_policy);
     }
 
-    stats.n_miss += plan.loads.size();
-    stats.n_hit  += n_required - plan.loads.size();
-
     bool waited = false;
+    size_t n_tasks = 0;
     for (const int32_t slot : plan.required_slots) {
         GGML_ASSERT(slot >= 0 && (uint32_t) slot < sl.n_slots);
         if (sl.slot_state[slot] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-            q_demand.push_back({ &sl, sl.slot_expert[slot], slot, sl.slot_gen[slot], ggml_time_us() });
-            cv_work.notify_one();
+            n_tasks += queue_load_locked(sl, sl.slot_expert[slot], slot);
             waited = true;
         }
     }
+    notify_workers_locked(n_tasks);
 
     if (!waited) {
         return;
     }
 
-    const int64_t t0 = ggml_time_us();
     cv_done.wait(lk, [&] {
         if (load_failed) {
             return true;
@@ -929,11 +986,6 @@ void llama_moe_stream::apply_plan_locked(
     });
     if (load_failed) {
         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
-    }
-    const int64_t elapsed_us = ggml_time_us() - t0;
-    stats.t_stall_us += elapsed_us;
-    if (resident_wait_us != nullptr) {
-        *resident_wait_us = elapsed_us;
     }
 }
 
@@ -1020,23 +1072,6 @@ void llama_moe_stream::count_token_stats_locked(
 }
 
 void llama_moe_stream::print_stats() const {
-    std::lock_guard<std::mutex> lock(mtx);
-
-    const int64_t n_touched = stats.n_hit + stats.n_miss;
-    LLAMA_LOG_INFO("%s: moe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n",
-            __func__, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
-            n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
-    LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
-            __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
-    if (stats.n_wave_calls > 0) {
-        LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
-                __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
-    }
-    if (stats.n_shadow_plans > 0) {
-        LLAMA_LOG_INFO("%s: moe stream shadow: plans = %" PRId64 ", matched = %" PRId64 ", mismatched = %" PRId64 "\n",
-                __func__, stats.n_shadow_plans, stats.n_shadow_plans - stats.n_shadow_mismatches,
-                stats.n_shadow_mismatches);
-    }
 }
 
 static bool llama_moe_stream_shadow_prepare(
@@ -1067,25 +1102,13 @@ static bool llama_moe_stream_shadow_prepare(
         /* .hot_decay_interval = */ mgr->hot_decay_interval,
     };
 
-    mgr->stats.n_shadow_plans++;
-    if (mgr->token_stats_active) {
-        mgr->token_stats.n_shadow_plans++;
-    }
     if (!sl.shadow_ops->sync(sl.shadow_backend, &state)) {
-        mgr->stats.n_shadow_mismatches++;
-        if (mgr->token_stats_active) {
-            mgr->token_stats.n_shadow_mismatches++;
-        }
         LLAMA_LOG_ERROR("%s: layer %d: GPU state synchronization failed\n", __func__, sl.il);
         return false;
     }
 
     ggml_backend_moe_stream_cache_plan gpu = {};
     if (!sl.shadow_ops->prepare(sl.shadow_backend, selected, &gpu)) {
-        mgr->stats.n_shadow_mismatches++;
-        if (mgr->token_stats_active) {
-            mgr->token_stats.n_shadow_mismatches++;
-        }
         LLAMA_LOG_ERROR("%s: layer %d: GPU prepare failed\n", __func__, sl.il);
         sl.shadow_ops->abort(sl.shadow_backend, sl.il);
         return false;
@@ -1146,10 +1169,6 @@ static bool llama_moe_stream_shadow_prepare(
     }
 
     if (mismatch != nullptr) {
-        mgr->stats.n_shadow_mismatches++;
-        if (mgr->token_stats_active) {
-            mgr->token_stats.n_shadow_mismatches++;
-        }
         LLAMA_LOG_ERROR("%s: layer %d: %s mismatch at %zu: cpu=%d gpu=%d\n",
                 __func__, sl.il, mismatch, mismatch_index, cpu_value, gpu_value);
         sl.shadow_ops->abort(sl.shadow_backend, sl.il);
@@ -1191,17 +1210,15 @@ bool llama_moe_stream::eval_callback(
         return true;
     }
 
-    const int64_t callback_start_us = ggml_time_us();
-    const int64_t sync_us = ggml_backend_sched_get_last_eval_callback_sync_us(sched);
-    const int64_t segment_us = ggml_backend_sched_get_last_eval_callback_segment_us(sched);
+    const int64_t callback_start_us = token_stats_active ? ggml_time_us() : 0;
+    const int64_t segment_us = token_stats_active ?
+            ggml_backend_sched_get_last_eval_callback_segment_us(sched) : 0;
     ggml_backend_moe_stream_cache_plan gpu = {};
-    const int64_t prepare_start_us = ggml_time_us();
     if (!sl->decode_ops->prepare(backend, tensor, &gpu)) {
         LLAMA_LOG_ERROR("%s: GPU decode prepare failed for layer %d\n", __func__, layer_id);
         gpu_decode_state_ready = false;
         return false;
     }
-    const int64_t prepare_us = ggml_time_us() - prepare_start_us;
     const auto abort_plan = [&] {
         sl->decode_ops->abort(backend, layer_id);
         gpu_decode_state_ready = false;
@@ -1224,11 +1241,6 @@ bool llama_moe_stream::eval_callback(
         abort_plan();
         return false;
     }
-    if (token_stats_active && gpu.n_gpu_commit_carry > 0) {
-        token_stats.n_gpu_commit_carry += gpu.n_gpu_commit_carry;
-        token_stats.t_gpu_commit_carry_ns += gpu.t_gpu_commit_carry_ns;
-    }
-
     stats.n_calls++;
     gpu_decode_cpu_policy_stale = true;
     if (token_stats_active) {
@@ -1245,7 +1257,6 @@ bool llama_moe_stream::eval_callback(
     plan.mapped_topk.clear();
     plan.required_slots.clear();
     int64_t load_us = 0;
-    int64_t resident_wait_us = 0;
 
     if (slow_path) {
         start_workers_locked();
@@ -1280,46 +1291,32 @@ bool llama_moe_stream::eval_callback(
             abort_plan();
             return false;
         }
-        const int64_t load_start_us = ggml_time_us();
-        apply_plan_locked(lk, *sl, gpu.n_required, false, &resident_wait_us);
-        load_us = ggml_time_us() - load_start_us;
-    } else {
-        stats.n_hit += gpu.n_required;
+        const int64_t load_start_us = token_stats_active ? ggml_time_us() : 0;
+        apply_plan_locked(lk, *sl, gpu.n_required, false);
+        load_us = token_stats_active ? ggml_time_us() - load_start_us : 0;
     }
 
-    const int64_t commit_start_us = ggml_time_us();
     if (!sl->decode_ops->commit(backend, layer_id)) {
         LLAMA_LOG_ERROR("%s: GPU decode commit failed for layer %d\n", __func__, layer_id);
         abort_plan();
         return false;
     }
-    const int64_t commit_us = ggml_time_us() - commit_start_us;
-    if (!slow_path && token_stats_active) {
-        token_stats.n_gpu_hit_plans++;
-        token_stats.t_gpu_hit_segment_ns += gpu.t_gpu_segment_ns;
-        token_stats.t_gpu_hit_planner_ns += gpu.t_gpu_planner_ns;
-        token_stats.t_gpu_hit_wall_us += segment_us;
-        token_stats.t_gpu_hit_sync_us += sync_us;
-        token_stats.t_gpu_hit_cb_us += ggml_time_us() - callback_start_us;
-        token_stats.t_gpu_hit_prepare_us += prepare_us;
-        token_stats.t_gpu_hit_commit_us += commit_us;
-    } else if (slow_path && token_stats_active) {
+    if (slow_path && token_stats_active) {
         token_stats.n_gpu_slow_plans++;
-        token_stats.n_gpu_slow_loads += gpu.n_loads;
-        token_stats.t_gpu_slow_segment_ns += gpu.t_gpu_segment_ns;
-        token_stats.t_gpu_slow_planner_ns += gpu.t_gpu_planner_ns;
+        if (gpu.n_loads == 1) {
+            token_stats.n_gpu_single_load_misses++;
+            token_stats.t_gpu_single_load_us += load_us;
+        } else if (gpu.n_loads == 2) {
+            token_stats.n_gpu_double_load_misses++;
+            token_stats.t_gpu_double_load_us += load_us;
+        }
         token_stats.t_gpu_slow_wall_us += segment_us;
-        token_stats.t_gpu_slow_sync_us += sync_us;
         token_stats.t_gpu_slow_cb_us += ggml_time_us() - callback_start_us;
-        token_stats.t_gpu_slow_prepare_us += prepare_us;
         token_stats.t_gpu_slow_load_us += load_us;
-        token_stats.t_gpu_slow_commit_us += commit_us;
         if (gpu.t_gpu_skip_tail_ns > 0) {
             token_stats.n_gpu_slow_skip_tail++;
             token_stats.t_gpu_slow_skip_tail_ns += gpu.t_gpu_skip_tail_ns;
         }
-        token_stats.n_gpu_slow_waiting += gpu.n_waiting;
-        token_stats.t_gpu_slow_resident_wait_us += resident_wait_us;
     }
     return true;
 }
@@ -1405,10 +1402,6 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mgr->apply_plan_locked(lk, *sl);
     mgr->commit_plan_locked(*sl, ids, out, n);
     if (shadow_pending && !sl->shadow_ops->commit(sl->shadow_backend, sl->il)) {
-        mgr->stats.n_shadow_mismatches++;
-        if (mgr->token_stats_active) {
-            mgr->token_stats.n_shadow_mismatches++;
-        }
         LLAMA_LOG_ERROR("%s: layer %d: GPU commit failed\n", __func__, sl->il);
         sl->shadow_ops->abort(sl->shadow_backend, sl->il);
     }
@@ -1491,8 +1484,8 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
 
     // reserve and demand-load this wave's experts (per-expert, same path as the decode remap)
     bool waited = false;
+    size_t n_tasks = 0;
     if (count > 0) {
-        stats.n_waves_run++;
         for (size_t i = first; i < first + count; i++) {
             const int32_t e  = sl.uniq[i];
             const auto    it = sl.expert_slot.find(e);
@@ -1500,13 +1493,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // already in the cache (resident, or still loading from the previous wave's preload)
                 const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s], ggml_time_us() }); // promote to demand, wait for it
-                    cv_work.notify_one();
+                    n_tasks += queue_load_locked(sl, e, s);
                     waited = true;
-                } else {
-                    stats.n_preload_ready++; // resident from the previous wave's preload
                 }
-                stats.n_hit++;
                 sl.keep[s] = 1;
                 sl.demand_slots.push_back(s);
             } else {
@@ -1518,13 +1507,8 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
                     }
                 }
-                if (!sl.seen[e]) {
-                    stats.n_miss_cold++;
-                }
                 reserve_slot_locked(sl, e, v);
-                q_demand.push_back({ &sl, e, v, sl.slot_gen[v], ggml_time_us() });
-                cv_work.notify_one();
-                stats.n_miss++;
+                n_tasks += queue_load_locked(sl, e, v);
                 waited = true;
                 sl.keep[v] = 1;
                 sl.demand_slots.push_back(v);
@@ -1544,19 +1528,15 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             if (v < 0) {
                 continue;
             }
-            if (!sl.seen[e]) {
-                stats.n_miss_cold++;
-            }
             reserve_slot_locked(sl, e, v);
             sl.keep[v] = 1;
-            q_demand.push_back({ &sl, e, v, sl.slot_gen[v], ggml_time_us() });
-            cv_work.notify_one();
-            stats.n_preload_issued++;
+            n_tasks += queue_load_locked(sl, e, v);
         }
     }
 
+    notify_workers_locked(n_tasks);
+
     if (waited) {
-        const int64_t t0 = ggml_time_us();
         cv_done.wait(lk, [&]{
             if (load_failed) {
                 return true;
@@ -1571,7 +1551,6 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
         if (load_failed) {
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
-        stats.t_stall_wave_us += ggml_time_us() - t0;
     }
 
     // parking pool: this wave's own resident slots plus the borrowed ones (all keep-protected;
@@ -1655,7 +1634,6 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
     }
 
-    mgr->stats.n_wave_calls++;
 
     if (w == 0) {
         mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);

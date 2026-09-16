@@ -1388,13 +1388,10 @@ llm_graph_result * llama_context::process_ubatch(
     }
     const bool moe_stream_continuous = gpu_decode_active && model.moe_stream() != nullptr &&
             model.moe_stream()->gpu_decode_continuous && cparams.cb_eval == nullptr;
-    const int moe_stream_continuous_window = moe_stream_continuous ?
-            model.moe_stream()->gpu_decode_continuous_window : 0;
     const int moe_stream_rolling_lookahead = moe_stream_continuous ?
             model.moe_stream()->gpu_decode_rolling_lookahead : 0;
     ggml_backend_sched_set_moe_stream_continuous(
-            sched.get(), moe_stream_continuous, moe_stream_continuous_window,
-            moe_stream_rolling_lookahead);
+            sched.get(), moe_stream_continuous, moe_stream_rolling_lookahead);
     const auto gparams = graph_params(res, ubatch, mctx, gtype, gpu_decode_active);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
@@ -1447,8 +1444,8 @@ llm_graph_result * llama_context::process_ubatch(
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    llama_moe_stream * mstream = moe_stats_active ? model.moe_stream() : nullptr;
-    if (mstream) {
+    llama_moe_stream * mstream = model.moe_stream();
+    if (mstream && moe_stats_active) {
         mstream->token_stats_begin();
     }
 
@@ -1457,68 +1454,35 @@ llm_graph_result * llama_context::process_ubatch(
     if (status == GGML_STATUS_SUCCESS && mstream && moe_stream_continuous) {
         mstream->record_continuous_hits(
                 (size_t) ggml_backend_sched_get_last_moe_stream_hit_plans(sched.get()));
-        mstream->record_continuous_resume_submit(
-                (size_t) ggml_backend_sched_get_last_moe_stream_resume_count(sched.get()),
-                ggml_backend_sched_get_last_moe_stream_resume_submit_us(sched.get()));
-        mstream->record_continuous_submit_profile(
-                (size_t) ggml_backend_sched_get_last_moe_stream_graph_call_count(sched.get()),
-                ggml_backend_sched_get_last_moe_stream_submit_front_us(sched.get()),
-                ggml_backend_sched_get_last_moe_stream_record_tail_us(sched.get()),
-                (size_t) ggml_backend_sched_get_last_moe_stream_vk_submit_count(sched.get()),
-                ggml_backend_sched_get_last_moe_stream_vk_submit_us(sched.get()),
-                (size_t) ggml_backend_sched_get_last_moe_stream_submit_gap_count(sched.get()),
-                ggml_backend_sched_get_last_moe_stream_submit_gap_ns(sched.get()));
-        mstream->record_continuous_window_gaps(
-                (size_t) ggml_backend_sched_get_last_moe_stream_window_gap_count(sched.get()),
-                ggml_backend_sched_get_last_moe_stream_window_gap_ns(sched.get()));
+        if (moe_stats_active) {
+            mstream->record_continuous_resume_submit(
+                    (size_t) ggml_backend_sched_get_last_moe_stream_resume_count(sched.get()),
+                    ggml_backend_sched_get_last_moe_stream_resume_submit_us(sched.get()));
+            mstream->record_continuous_submit_profile(
+                    (size_t) ggml_backend_sched_get_last_moe_stream_graph_call_count(sched.get()),
+                    ggml_backend_sched_get_last_moe_stream_record_tail_us(sched.get()));
+        }
     }
 
-    if (mstream) {
+    if (mstream && moe_stats_active) {
         const auto stats = mstream->token_stats_end();
         auto & phase = moe_stats_prefill ? this->moe_stats_prefill : moe_stats_decode;
-        phase.n_hit               += stats.n_hit;
-        phase.n_miss              += stats.n_miss;
-        phase.n_shadow_plans      += stats.n_shadow_plans;
-        phase.n_shadow_mismatches += stats.n_shadow_mismatches;
-        phase.n_gpu_hit_plans      += stats.n_gpu_hit_plans;
-        phase.t_gpu_hit_segment_ns += stats.t_gpu_hit_segment_ns;
-        phase.t_gpu_hit_planner_ns += stats.t_gpu_hit_planner_ns;
-        phase.t_gpu_hit_wall_us    += stats.t_gpu_hit_wall_us;
-        phase.t_gpu_hit_sync_us    += stats.t_gpu_hit_sync_us;
-        phase.t_gpu_hit_cb_us      += stats.t_gpu_hit_cb_us;
-        phase.t_gpu_hit_prepare_us += stats.t_gpu_hit_prepare_us;
-        phase.t_gpu_hit_commit_us  += stats.t_gpu_hit_commit_us;
+        phase.n_hit                   += stats.n_hit;
+        phase.n_miss                  += stats.n_miss;
         phase.n_gpu_slow_plans      += stats.n_gpu_slow_plans;
-        phase.n_gpu_slow_loads      += stats.n_gpu_slow_loads;
-        phase.t_gpu_slow_segment_ns += stats.t_gpu_slow_segment_ns;
-        phase.t_gpu_slow_planner_ns += stats.t_gpu_slow_planner_ns;
+        phase.n_gpu_single_load_misses += stats.n_gpu_single_load_misses;
+        phase.t_gpu_single_load_us     += stats.t_gpu_single_load_us;
+        phase.n_gpu_double_load_misses += stats.n_gpu_double_load_misses;
+        phase.t_gpu_double_load_us     += stats.t_gpu_double_load_us;
         phase.t_gpu_slow_wall_us    += stats.t_gpu_slow_wall_us;
-        phase.t_gpu_slow_sync_us    += stats.t_gpu_slow_sync_us;
         phase.t_gpu_slow_cb_us      += stats.t_gpu_slow_cb_us;
-        phase.t_gpu_slow_prepare_us += stats.t_gpu_slow_prepare_us;
         phase.t_gpu_slow_load_us    += stats.t_gpu_slow_load_us;
-        phase.t_gpu_slow_commit_us  += stats.t_gpu_slow_commit_us;
         phase.n_gpu_slow_skip_tail  += stats.n_gpu_slow_skip_tail;
         phase.t_gpu_slow_skip_tail_ns += stats.t_gpu_slow_skip_tail_ns;
         phase.n_gpu_slow_resume_submit += stats.n_gpu_slow_resume_submit;
         phase.t_gpu_slow_resume_submit_us += stats.t_gpu_slow_resume_submit_us;
         phase.n_gpu_submit_graph_calls += stats.n_gpu_submit_graph_calls;
-        phase.t_gpu_submit_front_us    += stats.t_gpu_submit_front_us;
         phase.t_gpu_record_tail_us     += stats.t_gpu_record_tail_us;
-        phase.n_gpu_vk_submits         += stats.n_gpu_vk_submits;
-        phase.t_gpu_vk_submit_us       += stats.t_gpu_vk_submit_us;
-        phase.n_gpu_submit_gaps        += stats.n_gpu_submit_gaps;
-        phase.t_gpu_submit_gap_ns      += stats.t_gpu_submit_gap_ns;
-        phase.n_gpu_window_gaps        += stats.n_gpu_window_gaps;
-        phase.t_gpu_window_gap_ns      += stats.t_gpu_window_gap_ns;
-        phase.n_gpu_slow_waiting     += stats.n_gpu_slow_waiting;
-        phase.t_gpu_slow_resident_wait_us += stats.t_gpu_slow_resident_wait_us;
-        phase.n_gpu_commit_carry     += stats.n_gpu_commit_carry;
-        phase.t_gpu_commit_carry_ns  += stats.t_gpu_commit_carry_ns;
-        phase.n_worker_loads         += stats.n_worker_loads;
-        phase.t_worker_queue_us      += stats.t_worker_queue_us;
-        phase.t_worker_read_us       += stats.t_worker_read_us;
-        phase.t_worker_upload_us     += stats.t_worker_upload_us;
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -3384,7 +3348,7 @@ void llama_context::perf_reset() {
 void llama_context::moe_stream_stats_reset() {
     moe_stats_prefill = {};
     moe_stats_decode  = {};
-    moe_stats_active  = model.moe_stream() != nullptr;
+    moe_stats_active  = model.moe_stream() != nullptr && model.moe_stream()->profile;
 }
 
 void llama_context::moe_stream_stats_print() const {
@@ -3402,146 +3366,48 @@ void llama_context::moe_stream_stats_print() const {
     print_phase("prefill", moe_stats_prefill.n_hit, moe_stats_prefill.n_miss);
     print_phase("decode",  moe_stats_decode.n_hit,  moe_stats_decode.n_miss);
 
-    const auto print_gpu_hit_profile = [](const char * phase, const auto & stats) {
-        if (stats.n_gpu_hit_plans == 0) {
-            return;
-        }
-        const double count = (double) stats.n_gpu_hit_plans;
-        const double host_gap_ms = std::max(0.0,
-                stats.t_gpu_hit_wall_us/1000.0 - stats.t_gpu_hit_segment_ns/1000000.0);
-        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-hit] plans=%" PRId64
-                " segment_wall=%.3f ms (%.3f ms/plan) segment_gpu=%.3f ms (%.3f ms/plan)"
-                " host_gap=%.3f ms (%.3f ms/plan) planner_gpu=%.3f ms (%.3f ms/plan)"
-                " sync_wait=%.3f ms (%.3f ms/plan)"
-                " callback=%.3f ms (%.3f ms/plan)"
-                " prepare=%.3f ms (%.3f ms/plan) commit=%.3f ms (%.3f ms/plan)\n",
-                phase, stats.n_gpu_hit_plans,
-                stats.t_gpu_hit_wall_us/1000.0, stats.t_gpu_hit_wall_us/1000.0/count,
-                stats.t_gpu_hit_segment_ns/1000000.0, stats.t_gpu_hit_segment_ns/1000000.0/count,
-                host_gap_ms, host_gap_ms/count,
-                stats.t_gpu_hit_planner_ns/1000000.0, stats.t_gpu_hit_planner_ns/1000000.0/count,
-                stats.t_gpu_hit_sync_us/1000.0, stats.t_gpu_hit_sync_us/1000.0/count,
-                stats.t_gpu_hit_cb_us/1000.0, stats.t_gpu_hit_cb_us/1000.0/count,
-                stats.t_gpu_hit_prepare_us/1000.0, stats.t_gpu_hit_prepare_us/1000.0/count,
-                stats.t_gpu_hit_commit_us/1000.0, stats.t_gpu_hit_commit_us/1000.0/count);
-    };
-    const auto print_gpu_slow_profile = [](const char * phase, const auto & stats) {
-        if (stats.n_gpu_slow_plans == 0) {
-            return;
-        }
-        const double count = (double) stats.n_gpu_slow_plans;
-        const double host_gap_ms = std::max(0.0,
-                stats.t_gpu_slow_wall_us/1000.0 - stats.t_gpu_slow_segment_ns/1000000.0);
-        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-slow] plans=%" PRId64 " loads=%" PRId64
-                " segment_wall=%.3f ms (%.3f ms/plan) segment_gpu=%.3f ms (%.3f ms/plan)"
-                " host_gap=%.3f ms (%.3f ms/plan) planner_gpu=%.3f ms (%.3f ms/plan)"
-                " sync_wait=%.3f ms (%.3f ms/plan)"
-                " load_wait=%.3f ms (%.3f ms/plan) callback=%.3f ms (%.3f ms/plan)"
-                " prepare=%.3f ms (%.3f ms/plan) commit=%.3f ms (%.3f ms/plan)",
-                phase, stats.n_gpu_slow_plans, stats.n_gpu_slow_loads,
-                stats.t_gpu_slow_wall_us/1000.0, stats.t_gpu_slow_wall_us/1000.0/count,
-                stats.t_gpu_slow_segment_ns/1000000.0, stats.t_gpu_slow_segment_ns/1000000.0/count,
-                host_gap_ms, host_gap_ms/count,
-                stats.t_gpu_slow_planner_ns/1000000.0, stats.t_gpu_slow_planner_ns/1000000.0/count,
-                stats.t_gpu_slow_sync_us/1000.0, stats.t_gpu_slow_sync_us/1000.0/count,
-                stats.t_gpu_slow_load_us/1000.0, stats.t_gpu_slow_load_us/1000.0/count,
-                stats.t_gpu_slow_cb_us/1000.0, stats.t_gpu_slow_cb_us/1000.0/count,
-                stats.t_gpu_slow_prepare_us/1000.0, stats.t_gpu_slow_prepare_us/1000.0/count,
-                stats.t_gpu_slow_commit_us/1000.0, stats.t_gpu_slow_commit_us/1000.0/count);
-        if (stats.n_gpu_slow_skip_tail > 0) {
-            const double skip_count = (double) stats.n_gpu_slow_skip_tail;
-            std::fprintf(stderr, " skip_tail_gpu=%.3f ms (%.3f ms/miss)",
-                    stats.t_gpu_slow_skip_tail_ns/1000000.0,
-                    stats.t_gpu_slow_skip_tail_ns/1000000.0/skip_count);
-        }
-        if (stats.n_gpu_slow_resume_submit > 0) {
-            const double resume_count = (double) stats.n_gpu_slow_resume_submit;
-            std::fprintf(stderr, " resume_submit=%.3f ms (%.3f ms/miss)",
-                    stats.t_gpu_slow_resume_submit_us/1000.0,
-                    stats.t_gpu_slow_resume_submit_us/1000.0/resume_count);
-        }
-        if (stats.n_gpu_submit_graph_calls > 0) {
-            const double graph_calls = (double) stats.n_gpu_submit_graph_calls;
-            std::fprintf(stderr,
-                    " submit_front=%.3f ms (%.3f ms/graph, graphs=%" PRId64 ")"
-                    " record_tail=%.3f ms (%.3f ms/graph)",
-                    stats.t_gpu_submit_front_us/1000.0,
-                    stats.t_gpu_submit_front_us/1000.0/graph_calls,
-                    stats.n_gpu_submit_graph_calls,
-                    stats.t_gpu_record_tail_us/1000.0,
-                    stats.t_gpu_record_tail_us/1000.0/graph_calls);
-        }
-        if (stats.n_gpu_vk_submits > 0) {
-            const double vk_submits = (double) stats.n_gpu_vk_submits;
-            std::fprintf(stderr, " vk_submit_cpu=%.3f ms (%.3f ms/call, calls=%" PRId64 ")",
-                    stats.t_gpu_vk_submit_us/1000.0,
-                    stats.t_gpu_vk_submit_us/1000.0/vk_submits,
-                    stats.n_gpu_vk_submits);
-        }
-        if (stats.n_gpu_submit_gaps > 0) {
-            const double submit_gaps = (double) stats.n_gpu_submit_gaps;
-            std::fprintf(stderr, " submit_gap_gpu=%.3f ms (%.3f ms/gap, gaps=%" PRId64 ")",
-                    stats.t_gpu_submit_gap_ns/1000000.0,
-                    stats.t_gpu_submit_gap_ns/1000000.0/submit_gaps,
-                    stats.n_gpu_submit_gaps);
-        }
-        if (stats.n_gpu_window_gaps > 0) {
-            const double gap_count = (double) stats.n_gpu_window_gaps;
-            std::fprintf(stderr, " window_gap_gpu=%.3f ms (%.3f ms/boundary, boundaries=%" PRId64 ")",
-                    stats.t_gpu_window_gap_ns/1000000.0,
-                    stats.t_gpu_window_gap_ns/1000000.0/gap_count,
-                    stats.n_gpu_window_gaps);
-        } else {
-            std::fprintf(stderr, " window_gap_gpu=0.000 ms (boundaries=0)");
-        }
-        std::fprintf(stderr, "\n");
-    };
-    print_gpu_hit_profile("prefill", moe_stats_prefill);
-    print_gpu_hit_profile("decode",  moe_stats_decode);
-    print_gpu_slow_profile("prefill", moe_stats_prefill);
-    print_gpu_slow_profile("decode",  moe_stats_decode);
-
-    const auto print_gpu_carry_profile = [](const char * phase, const auto & stats) {
-        if (stats.n_gpu_commit_carry == 0) {
-            return;
-        }
-        const double count = (double) stats.n_gpu_commit_carry;
-        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-carry] commits=%" PRId64
-                " commit_gpu=%.3f ms (%.3f ms/commit)\n",
-                phase, stats.n_gpu_commit_carry,
-                stats.t_gpu_commit_carry_ns/1000000.0,
-                stats.t_gpu_commit_carry_ns/1000000.0/count);
-    };
-    const auto print_gpu_load_detail = [](const char * phase, const auto & stats) {
-        if (stats.n_gpu_slow_plans == 0) {
-            return;
-        }
+    const auto & stats = moe_stats_decode;
+    if (stats.n_gpu_slow_plans > 0) {
         const double plans = (double) stats.n_gpu_slow_plans;
-        const double loads = (double) std::max<int64_t>(1, stats.n_worker_loads);
-        std::fprintf(stderr, "[MOE_STREAM_PROFILE][%s-load-detail] new_loads=%" PRId64
-                " waiting=%" PRId64 " resident_wait=%.3f ms (%.3f ms/plan)"
-                " worker_loads=%" PRId64 " queue=%.3f ms (%.3f ms/load)"
-                " read=%.3f ms (%.3f ms/load) upload=%.3f ms (%.3f ms/load)\n",
-                phase, stats.n_gpu_slow_loads, stats.n_gpu_slow_waiting,
-                stats.t_gpu_slow_resident_wait_us/1000.0,
-                stats.t_gpu_slow_resident_wait_us/1000.0/plans,
-                stats.n_worker_loads,
-                stats.t_worker_queue_us/1000.0, stats.t_worker_queue_us/1000.0/loads,
-                stats.t_worker_read_us/1000.0, stats.t_worker_read_us/1000.0/loads,
-                stats.t_worker_upload_us/1000.0, stats.t_worker_upload_us/1000.0/loads);
-    };
-    print_gpu_carry_profile("prefill", moe_stats_prefill);
-    print_gpu_carry_profile("decode",  moe_stats_decode);
-    print_gpu_load_detail("prefill", moe_stats_prefill);
-    print_gpu_load_detail("decode",  moe_stats_decode);
+        const double skips = (double) std::max<int64_t>(1, stats.n_gpu_slow_skip_tail);
+        const double resumes = (double) std::max<int64_t>(1, stats.n_gpu_slow_resume_submit);
+        const double graphs = (double) std::max<int64_t>(1, stats.n_gpu_submit_graph_calls);
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][decode-slow]"
+                " segment_wall=%.3f ms (%.3f ms/plan)"
+                " load_wait=%.3f ms (%.3f ms/plan)"
+                " callback=%.3f ms (%.3f ms/plan)"
+                " skip_tail_gpu=%.3f ms (%.3f ms/miss)"
+                " resume_submit=%.3f ms (%.3f ms/miss)"
+                " record_tail=%.3f ms (%.3f ms/graph)\n",
+                stats.t_gpu_slow_wall_us/1000.0, stats.t_gpu_slow_wall_us/1000.0/plans,
+                stats.t_gpu_slow_load_us/1000.0, stats.t_gpu_slow_load_us/1000.0/plans,
+                stats.t_gpu_slow_cb_us/1000.0, stats.t_gpu_slow_cb_us/1000.0/plans,
+                stats.t_gpu_slow_skip_tail_ns/1000000.0,
+                stats.t_gpu_slow_skip_tail_ns/1000000.0/skips,
+                stats.t_gpu_slow_resume_submit_us/1000.0,
+                stats.t_gpu_slow_resume_submit_us/1000.0/resumes,
+                stats.t_gpu_record_tail_us/1000.0,
+                stats.t_gpu_record_tail_us/1000.0/graphs);
 
-    if (model.moe_stream()->shadow) {
-        const auto print_shadow = [](const char * phase, int64_t plans, int64_t mismatches) {
-            std::fprintf(stderr, "[MOE_STREAM_SHADOW][%s] plans=%" PRId64 " matched=%" PRId64
-                    " mismatched=%" PRId64 "\n", phase, plans, plans - mismatches, mismatches);
-        };
-        print_shadow("prefill", moe_stats_prefill.n_shadow_plans, moe_stats_prefill.n_shadow_mismatches);
-        print_shadow("decode",  moe_stats_decode.n_shadow_plans,  moe_stats_decode.n_shadow_mismatches);
+        const double single = (double) stats.n_gpu_single_load_misses;
+        const double single_avg_ms = single > 0 ? stats.t_gpu_single_load_us/1000.0/single : 0.0;
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][decode-miss1] misses=%" PRId64
+                "/%" PRId64 " (%.2f%%) load_wait=%.3f ms (%.3f ms/miss)\n",
+                stats.n_gpu_single_load_misses,
+                stats.n_gpu_slow_plans,
+                100.0*single/plans,
+                stats.t_gpu_single_load_us/1000.0,
+                single_avg_ms);
+        const double double_load = (double) stats.n_gpu_double_load_misses;
+        const double double_avg_ms = double_load > 0 ? stats.t_gpu_double_load_us/1000.0/double_load : 0.0;
+        std::fprintf(stderr, "[MOE_STREAM_PROFILE][decode-miss2] misses=%" PRId64
+                "/%" PRId64 " (%.2f%%) load_wait=%.3f ms (%.3f ms/miss)\n",
+                stats.n_gpu_double_load_misses,
+                stats.n_gpu_slow_plans,
+                100.0*double_load/plans,
+                stats.t_gpu_double_load_us/1000.0,
+                double_avg_ms);
+
     }
 }
 
